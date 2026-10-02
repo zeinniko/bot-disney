@@ -1,4 +1,5 @@
 import asyncio
+import random
 import time
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
@@ -209,35 +210,46 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
 
     try:
         pw = await async_playwright().start()
+        # Daftar User-Agent perangkat seluler (iPhone / Android) yang valid dan natural
+        mobile_user_agents = [
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+        ]
+        
+        selected_ua = random.choice(mobile_user_agents)
+
+        # Meluncurkan browser dengan argumen tambahan untuk menghindari deteksi bot di VPS
         browser = await pw.chromium.launch(
-            headless=HEADLESS_MODE, 
+            headless=True,
             args=[
-                "--disable-blink-features=AutomationControlled", 
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
-                "--no-first-run",
-                "--no-zygote",
-                "--disable-infobars",
-                "--window-size=1280,720",
-                "--lang=en-US,en",
-                # Tambahan baru untuk VPS Headless:
                 "--disable-gpu",
-                "--disable-software-rasterizer",
-                "--disable-extensions",
-                "--disable-features=IsolateOrigins,site-per-process"
+                "--disable-infobars",
+                "--window-size=390,844",
+                "--disable-blink-features=AutomationControlled", # Mencegah deteksi properti webdriver
             ]
         )
+
+        # Membuat context dengan emulasi perangkat seluler (Mobile Viewport & Touch)
         context = await browser.new_context(
-            storage_state="session_state.json",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36", 
-            locale="en-US",
-            ignore_https_errors=True,
-            viewport={'width': 1280, 'height': 720},
-            java_script_enabled=True
+            user_agent=selected_ua,
+            viewport={'width': 390, 'height': 844},
+            device_scale_factor=3,
+            is_mobile=True,
+            has_touch=True,
+            locale="en-GB",
+            timezone_id="Europe/London"
         )
-        await context.clear_cookies()
+
+        # Menyuntikkan script JS untuk menyembunyikan jejak otomatisasi (navigator.webdriver)
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
         page = await context.new_page()
 
         ACTIVE_BROWSER_SESSIONS[chat_id] = {
