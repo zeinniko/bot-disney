@@ -15,7 +15,7 @@ async def login_disney(page, context, email: str, password: str, progress_cb: Ca
     if progress_cb:
         await progress_cb("🔑 Membuka halaman login…")
     
-    await page.goto("https://www.disneyplus.com/en-gb/login", wait_until="domcontentloaded")
+    await page.goto("https://www.disneyplus.com/en-gb/identity/login", wait_until="domcontentloaded")
     await page.wait_for_timeout(6000)
 
     if progress_cb:
