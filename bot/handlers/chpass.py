@@ -66,7 +66,8 @@ async def handle_input_chpass_only(message: types.Message, state: FSMContext):
         if not is_process_active(chat_id):
             raise Exception("Proses dihentikan oleh pengguna.")
         executed_steps.append(step_text)
-        report_text = f"<pre>{'\n'.join(executed_steps)}</pre>"
+        steps_joined = "\n".join(executed_steps)
+        report_text = f"<pre>{steps_joined}</pre>"        
         try:
             await status_msg.edit_text(
                 text=report_text,
