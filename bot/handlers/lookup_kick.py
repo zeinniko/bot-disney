@@ -107,7 +107,10 @@ async def close_session(chat_id: int):
 
 async def fetch_devices_from_page(page) -> list:
     """Fungsi pembantu membaca elemen daftar device dari DOM"""
-    await page.wait_for_selector('[data-testid^="device-details-"]', timeout=20000)
+    try:
+        await page.wait_for_selector('[data-testid^="device-details-"]', state="attached", timeout=20000)
+    except Exception:
+        pass
     cards = await page.query_selector_all('[data-testid^="device-details-"]')
     
     devices_data = []
@@ -264,7 +267,7 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
             pass
 
         await append_progress("📱 Membuka daftar perangkat...")
-        await page.goto("https://www.disneyplus.com/en-gb/identity/manage-devices", wait_until="commit", timeout=30000)
+        await page.goto("https://www.disneyplus.com/en-gb/identity/manage-devices", wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(3000)
 
         devices = await fetch_devices_from_page(page)

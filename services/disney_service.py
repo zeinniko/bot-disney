@@ -15,13 +15,16 @@ async def login_disney(page, context, email: str, password: str, progress_cb: Ca
     if progress_cb:
         await progress_cb("🔑 Membuka halaman login…")
     await page.goto("https://www.disneyplus.com/en-gb/login", wait_until="commit")
-    await page.wait_for_load_state("domcontentloaded")
     await page.wait_for_timeout(2000)
 
     if progress_cb:
         await progress_cb("📧 Mengisi email…")
     email_selector = 'input[data-testid="lookupValue"], #lookupValue, input[name="lookupValue"]'
-    await page.wait_for_selector(email_selector, state="visible", timeout=30000)
+    try:
+        await page.wait_for_selector(email_selector, state="attached", timeout=35000)
+    except Exception:
+        pass
+
     await page.fill(email_selector, email)
     
     submit_btn = 'button[data-testid="id-flow-submit"], #id-flow'
@@ -489,11 +492,20 @@ async def change_disney_password(email: str, current_password: str, new_password
             await ensure_not_on_select_profile()
 
             if "commerce/account" not in page.url:
-                await page.goto("https://www.disneyplus.com/en-gb/commerce/account", wait_until="commit", timeout=30000)
-                await page.wait_for_timeout(3000)
+                await page.goto("https://www.disneyplus.com/en-gb/commerce/account", wait_until="domcontentloaded", timeout=40000)
+                await page.wait_for_timeout(4000)
 
-            manage_btn_selector = 'button[data-testid="manage-email-and-password"], [data-testid="manage-email-and-password"]'
-            manage_elem, active_page = await get_element(manage_btn_selector, timeout=20000)
+            manage_btn_selector = 'button[data-testid="manage-email-and-password"], [data-testid="manage-email-and-password"], a[data-testid="manage-email-and-password"]'
+            
+            # Perpanjang timeout menjadi 30 detik untuk memberikan waktu iframe/DOM merender tombol
+            try:
+                manage_elem, active_scope = await get_element(manage_btn_selector, timeout=30000)
+            except Exception:
+                # Fallback: Jika tombol tidak ketemu, refresh/buka ulang halaman account
+                await page.reload(wait_until="domcontentloaded")
+                await page.wait_for_timeout(4000)
+                manage_elem, active_scope = await get_element(manage_btn_selector, timeout=20000)
+
             await manage_elem.click(force=True)
             await page.wait_for_timeout(4000)
 
@@ -907,11 +919,19 @@ async def process_kick_all_in_new_tab(popup_page, email: str, password: str, pro
         if progress_cb:
             await progress_cb("⚙️ Menunggu tombol konfirmasi 'Keluar' akhir...")
 
-        final_logout_selector = 'button[data-testid="modal-primary-button"], button[data-testid="sign-out"], button:has-text("Keluar"), button:has-text("Log Out"), button:has-text("Sign Out")'
+        # Tambahkan data-testid tombol "Keluar" yang baru ke dalam selector
+        final_logout_selector = (
+            'button[data-testid="log-out-everywhere__button--submit-log-out-everywhere"], '
+            'button[data-testid="modal-primary-button"], '
+            'button[data-testid="sign-out"], '
+            'button:has-text("Keluar"), '
+            'button:has-text("Log Out"), '
+            'button:has-text("Sign Out")'
+        )
 
         try:
             # Tunggu tombol konfirmasi Keluar/Log Out muncul setelah OTP sukses
-            await target_frame.wait_for_selector(final_logout_selector, state="visible", timeout=10000)
+            await target_frame.wait_for_selector(final_logout_selector, state="visible", timeout=15000)
 
             if progress_cb:
                 await progress_cb("🔴 Menekan tombol Keluar / Log Out akhir...")
@@ -920,14 +940,9 @@ async def process_kick_all_in_new_tab(popup_page, email: str, password: str, pro
             await final_btn.click(force=True)
             await popup_page.wait_for_timeout(3000)
 
-        except Exception:
-            # Jika tombol tidak muncul (misal langsung redirect otomatis), abaikan
-            pass
-
-        if progress_cb:
-            await progress_cb("✅ Selesai! Berhasil keluar dari semua perangkat.")
-
-        return True
+        except Exception as e:
+            if progress_cb:
+                await progress_cb(f"⚠️ Peringatan pada tombol keluar akhir: {str(e)}")
 
     except Exception as e:
         if progress_cb:
