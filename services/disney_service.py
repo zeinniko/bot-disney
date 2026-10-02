@@ -102,7 +102,6 @@ async def get_disney_devices(
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS_MODE, 
-            channel="chrome", 
             args=[
                 "--disable-blink-features=AutomationControlled", 
                 "--no-sandbox",
@@ -215,7 +214,6 @@ async def kick_all_devices(email: str, password: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS_MODE, 
-            channel="chrome", 
             args=[
                 "--disable-blink-features=AutomationControlled", 
                 "--no-sandbox",
@@ -273,7 +271,6 @@ async def kick_specific_devices(email: str, password: str, target_indexes: list)
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS_MODE, 
-            channel="chrome", 
             args=[
                 "--disable-blink-features=AutomationControlled", 
                 "--no-sandbox",
@@ -341,7 +338,6 @@ async def change_disney_password(email: str, current_password: str, new_password
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=HEADLESS_MODE, 
-            channel="chrome", 
             args=[
                 "--disable-blink-features=AutomationControlled", 
                 "--no-sandbox",
