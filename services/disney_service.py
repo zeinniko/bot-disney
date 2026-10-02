@@ -129,7 +129,7 @@ async def change_disney_password(email: str, current_password: str, new_password
 
         # 2. Buat Browser Context BARU yang terisolasi
         context = await browser.new_context(
-            storage_state="session_state.json"
+            storage_state="session_state.json",
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36", 
             locale="en-US",
             ignore_https_errors=True,
