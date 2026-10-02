@@ -109,7 +109,10 @@ async def get_disney_devices(
                 "--disable-dev-shm-usage",
                 "--disable-accelerated-2d-canvas",
                 "--no-first-run",
-                "--no-zygote"
+                "--no-zygote",
+                "--disable-infobars",
+                "--window-size=1280,720",
+                "--lang=en-US,en"
             ]
         )
 
@@ -155,7 +158,7 @@ async def get_disney_devices(
             if progress_cb:
                 await progress_cb("⚙️ Navigasi ke halaman Manage Devices...")
 
-            await page.goto("https://www.disneyplus.com/en-gb/identity/manage-devices", wait_until="domcontentloaded", timeout=30000)
+            await page.goto("https://www.disneyplus.com/en-gb/identity/manage-devices", wait_until="commit", timeout=30000)
             await page.wait_for_timeout(3000)
 
             # 5. Scraping Perangkat
@@ -221,7 +224,10 @@ async def kick_all_devices(email: str, password: str):
                 "--disable-dev-shm-usage",
                 "--disable-accelerated-2d-canvas",
                 "--no-first-run",
-                "--no-zygote"
+                "--no-zygote",
+                "--disable-infobars",
+                "--window-size=1280,720",
+                "--lang=en-US,en"
             ]
         )
 
@@ -246,7 +252,7 @@ async def kick_all_devices(email: str, password: str):
             if login_res["status"] != "success":
                 return login_res
 
-            await page.goto("https://www.disneyplus.com/en-gb/identity/manage-devices", wait_until="domcontentloaded")
+            await page.goto("https://www.disneyplus.com/en-gb/identity/manage-devices", wait_until="commit")
             await page.wait_for_timeout(3000)
 
             kick_all_anchor = 'a[data-testid="anchor-link"]:has-text("log out of all devices")'
@@ -278,7 +284,10 @@ async def kick_specific_devices(email: str, password: str, target_indexes: list)
                 "--disable-dev-shm-usage",
                 "--disable-accelerated-2d-canvas",
                 "--no-first-run",
-                "--no-zygote"
+                "--no-zygote",
+                "--disable-infobars",
+                "--window-size=1280,720",
+                "--lang=en-US,en"
             ]
         )
 
@@ -303,7 +312,7 @@ async def kick_specific_devices(email: str, password: str, target_indexes: list)
             if login_res["status"] != "success":
                 return login_res
 
-            await page.goto("https://www.disneyplus.com/en-gb/identity/manage-devices", wait_until="domcontentloaded")
+            await page.goto("https://www.disneyplus.com/en-gb/identity/manage-devices", wait_until="commit")
             await page.wait_for_timeout(3000)
 
             kicked_count = 0
@@ -345,7 +354,10 @@ async def change_disney_password(email: str, current_password: str, new_password
                 "--disable-dev-shm-usage",
                 "--disable-accelerated-2d-canvas",
                 "--no-first-run",
-                "--no-zygote"
+                "--no-zygote",
+                "--disable-infobars",
+                "--window-size=1280,720",
+                "--lang=en-US,en"
             ]
         )
 
@@ -477,7 +489,7 @@ async def change_disney_password(email: str, current_password: str, new_password
             await ensure_not_on_select_profile()
 
             if "commerce/account" not in page.url:
-                await page.goto("https://www.disneyplus.com/en-gb/commerce/account", wait_until="domcontentloaded", timeout=30000)
+                await page.goto("https://www.disneyplus.com/en-gb/commerce/account", wait_until="commit", timeout=30000)
                 await page.wait_for_timeout(3000)
 
             manage_btn_selector = 'button[data-testid="manage-email-and-password"], [data-testid="manage-email-and-password"]'

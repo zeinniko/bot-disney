@@ -215,7 +215,10 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
                 "--disable-dev-shm-usage",
                 "--disable-accelerated-2d-canvas",
                 "--no-first-run",
-                "--no-zygote"
+                "--no-zygote",
+                "--disable-infobars",
+                "--window-size=1280,720",
+                "--lang=en-US,en"
             ]
         )
         context = await browser.new_context(
@@ -261,7 +264,7 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
             pass
 
         await append_progress("📱 Membuka daftar perangkat...")
-        await page.goto("https://www.disneyplus.com/en-gb/identity/manage-devices", wait_until="domcontentloaded", timeout=30000)
+        await page.goto("https://www.disneyplus.com/en-gb/identity/manage-devices", wait_until="commit", timeout=30000)
         await page.wait_for_timeout(3000)
 
         devices = await fetch_devices_from_page(page)
