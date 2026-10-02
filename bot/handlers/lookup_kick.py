@@ -230,12 +230,11 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
             ]
         )
         context = await browser.new_context(
-            storage_state=None,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36", 
-            locale="en-US",
-            ignore_https_errors=True,
-            viewport={'width': 1280, 'height': 720},
-            java_script_enabled=True
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            viewport={'width': 390, 'height': 844},
+            device_scale_factor=3,
+            is_mobile=True,
+            has_touch=True
         )
         await context.clear_cookies()
         page = await context.new_page()
