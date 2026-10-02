@@ -14,22 +14,29 @@ async def login_disney(page, context, email: str, password: str, progress_cb: Ca
     
     if progress_cb:
         await progress_cb("🔑 Membuka halaman login…")
+    
     await page.goto("https://www.disneyplus.com/en-gb/login", wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(6000)
 
     if progress_cb:
         await progress_cb("📧 Mengisi email…")
+    
     email_selector = 'input[data-testid="lookupValue"], #lookupValue, input[name="lookupValue"]'
     try:
         await page.wait_for_selector(email_selector, state="attached", timeout=35000)
-    except Exception:
+        
+        email_input = page.locator(email_selector).first
+        await email_input.click(force=True)
+        await email_input.fill(email)
+        
+    except Exception as e:
         pass
 
     await page.fill(email_selector, email)
     
     submit_btn = 'button[data-testid="id-flow-submit"], #id-flow'
     await page.click(submit_btn)
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(3000)
 
     # 1. Cek Akun Tidak Terdaftar
     if await page.is_visible('button[data-testid="registration-prompt-submit-btn"]'):
