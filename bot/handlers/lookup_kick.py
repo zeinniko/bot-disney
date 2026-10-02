@@ -230,11 +230,12 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
             ]
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            viewport={'width': 390, 'height': 844},
-            device_scale_factor=3,
-            is_mobile=True,
-            has_touch=True
+            storage_state="session_state.json",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36", 
+            locale="en-US",
+            ignore_https_errors=True,
+            viewport={'width': 1280, 'height': 720},
+            java_script_enabled=True
         )
         await context.clear_cookies()
         page = await context.new_page()
@@ -257,9 +258,6 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
             await status_msg.edit_text(render_code_block(logs), parse_mode="Markdown")
             await close_session(chat_id)
             return
-
-        await append_progress("✅ Login via Password berhasil!")
-        await append_progress("⏳ Menunggu autentikasi selesai...")
 
         profile_selector = '[data-testid="profile-item"], .profile-avatar, [data-testid="profile-avatar"], button[aria-label*="Profile"]'
         try:

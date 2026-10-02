@@ -129,11 +129,12 @@ async def change_disney_password(email: str, current_password: str, new_password
 
         # 2. Buat Browser Context BARU yang terisolasi
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            viewport={'width': 390, 'height': 844},
-            device_scale_factor=3,
-            is_mobile=True,
-            has_touch=True
+            storage_state="session_state.json"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36", 
+            locale="en-US",
+            ignore_https_errors=True,
+            viewport={'width': 1280, 'height': 720},
+            java_script_enabled=True
         )
 
         # 3. Pastikan Cookies & Storage kosong
