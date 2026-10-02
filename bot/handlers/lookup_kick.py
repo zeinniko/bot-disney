@@ -221,7 +221,12 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
                 "--no-zygote",
                 "--disable-infobars",
                 "--window-size=1280,720",
-                "--lang=en-US,en"
+                "--lang=en-US,en",
+                # Tambahan baru untuk VPS Headless:
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-extensions",
+                "--disable-features=IsolateOrigins,site-per-process"
             ]
         )
         context = await browser.new_context(
