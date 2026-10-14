@@ -5,19 +5,25 @@ from aiogram.fsm.context import FSMContext
 
 from bot.keyboards import get_main_menu_button, get_stop_keyboard
 from bot.states import MenuState
-from services.disney_service import change_disney_password
+from services.disney_service import change_password_mydisney, change_password_and_kick_all_mydisney
 from database.db import get_account_by_access_code, update_account_password, log_activity
 from utils.process_manager import clear_process, is_process_active, start_process
 
 router = Router()
+
 
 def generate_random_password(length: int = 12) -> str:
     chars = string.ascii_letters + string.digits
     random_str = "".join(secrets.choice(chars) for _ in range(length - 4))
     return f"Ds#{random_str}9"
 
-@router.message(MenuState.chpass_only)
-async def handle_input_chpass_only(message: types.Message, state: FSMContext):
+
+async def execute_password_change_process(
+    message: types.Message,
+    state: FSMContext,
+    is_signout_all: bool = False
+):
+    """Fungsi helper utama untuk menangani chpass_only dan chpass_signout."""
     raw_data = message.text.strip()
     parts = [p.strip() for p in raw_data.split("|")]
 
@@ -32,19 +38,16 @@ async def handle_input_chpass_only(message: types.Message, state: FSMContext):
     email = parts[0]
     access_code = parts[1]
 
-    # 1. CEK DARI DATABASE LOKAL BUKAN INPUT USER
+    # 1. Cek Database Lokal
     acc_data = await get_account_by_access_code(email, access_code)
     if not acc_data:
         await message.answer(
-            "❌ **Verifikasi Gagal:** Email atau Kode Akses tidak ditemukan/salah!",
-            parse_mode="Markdown"
+            "❌ <b>Verifikasi Gagal:</b> Email atau Kode Akses tidak ditemukan/salah!",
+            parse_mode="HTML"
         )
         return
 
-    # Ambil Password Lama dari DB Lokal
     current_password = acc_data["current_password"]
-
-    # Target Password Baru
     password_target = (
         parts[2].strip()
         if (len(parts) >= 3 and parts[2].strip())
@@ -55,14 +58,15 @@ async def handle_input_chpass_only(message: types.Message, state: FSMContext):
     start_process(chat_id)
 
     executed_steps = []
+    action_title = "Change Password & Signout All" if is_signout_all else "Change Password"
+    
     status_msg = await message.answer(
-        "<pre>⏳ Memulai proses Change Password…</pre>",
+        f"<pre>⏳ Memulai proses {action_title}…</pre>",
         reply_markup=get_stop_keyboard(chat_id),
         parse_mode="HTML",
     )
 
     async def update_status(step_text: str):
-        # Pengecekan aktifnya proses setiap kali callback dipanggil
         if not is_process_active(chat_id):
             raise Exception("Proses dihentikan oleh pengguna.")
         executed_steps.append(step_text)
@@ -78,23 +82,38 @@ async def handle_input_chpass_only(message: types.Message, state: FSMContext):
             pass
 
     try:
-        # 2. PROSES OTOMASI PLAYWRIGHT
-        res = await change_disney_password(
-            email=email,
-            current_password=current_password,
-            new_password=password_target,
-            progress_cb=update_status
-        )
+        # 2. Eksekusi Service Playwright berdasarkan mode
+        if is_signout_all:
+            res = await change_password_and_kick_all_mydisney(
+                email=email,
+                new_password=password_target,
+                progress_cb=update_status
+            )
+            action_log = "CHPASS_SIGNOUT"
+        else:
+            tg_user_info = {
+                "id": message.from_user.id,
+                "username": message.from_user.username,
+                "full_name": message.from_user.full_name
+            }
+            res = await change_password_mydisney(
+                email=email,
+                new_password=password_target,
+                progress_cb=update_status,
+                telegram_user=tg_user_info,
+                keep_open = False
+            )
+            action_log = "CHANGE_PASSWORD"
 
         if not is_process_active(chat_id):
             raise Exception("Proses dihentikan oleh pengguna.")
 
         if res["status"] == "success":
             await update_account_password(email, password_target)
-            await log_activity(message.from_user.id, "CHANGE_PASSWORD", email, "SUCCESS")
+            await log_activity(message.from_user.id, action_log, email, "SUCCESS", "Password berhasil diperbarui")
 
             success_text = (
-                f"🎉 <b>Berhasil (Change Password)</b>\n"
+                f"🎉 <b>Berhasil ({action_title})</b>\n"
                 f"Email: <code>{email}</code>\n"
                 f"Password Baru: <code>{password_target}</code>"
             )
@@ -104,9 +123,9 @@ async def handle_input_chpass_only(message: types.Message, state: FSMContext):
                 parse_mode="HTML",
             )
         else:
-            await log_activity(message.from_user.id, "CHANGE_PASSWORD", email, "FAILED", res.get("message"))
+            await log_activity(message.from_user.id, action_log, email, "FAILED", res.get("message"))
             fail_text = (
-                f"❌ <b>Gagal (Change Password)</b>\n"
+                f"❌ <b>Gagal ({action_title})</b>\n"
                 f"Email: <code>{email}</code>\n"
                 f"Error: <code>{res.get('message', 'Terjadi kesalahan')}</code>"
             )
@@ -118,7 +137,8 @@ async def handle_input_chpass_only(message: types.Message, state: FSMContext):
 
     except Exception as err:
         error_reason = str(err)
-        await log_activity(message.from_user.id, "CHANGE_PASSWORD", email, "CANCELLED/FAILED", error_reason)
+        action_log = "CHPASS_SIGNOUT" if is_signout_all else "CHANGE_PASSWORD"
+        await log_activity(message.from_user.id, action_log, email, "CANCELLED/FAILED", error_reason)
         
         fail_text = (
             f"❌ <b>Proses Terhenti / Gagal</b>\n"
@@ -136,3 +156,15 @@ async def handle_input_chpass_only(message: types.Message, state: FSMContext):
 
     finally:
         clear_process(chat_id)
+
+
+# Handler untuk State Change Password Only
+@router.message(MenuState.chpass_only)
+async def handle_input_chpass_only(message: types.Message, state: FSMContext):
+    await execute_password_change_process(message, state, is_signout_all=False)
+
+
+# Handler untuk State Change Password + Signout All
+@router.message(MenuState.chpass_signout)
+async def handle_input_chpass_signout(message: types.Message, state: FSMContext):
+    await execute_password_change_process(message, state, is_signout_all=True)

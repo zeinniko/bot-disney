@@ -1,5 +1,4 @@
 import asyncio
-import random
 import time
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
@@ -7,8 +6,10 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from playwright.async_api import async_playwright
 from config.settings import HEADLESS_MODE
 from bot.states import MenuState
-from services.disney_service import login_disney, process_kick_all_in_new_tab
+from services.disney_service import login_disney
 from services.imap_service import fetch_disney_otp
+from bot.keyboards import get_main_menu_button
+from database.db import log_activity
 
 router = Router()
 
@@ -190,7 +191,11 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
     parts = [p.strip() for p in raw_data.split("|")]
 
     if len(parts) < 3:
-        await message.answer("⚠️️ Format salah. Gunakan format:\n<code>email|password|kode_akses</code>", parse_mode="HTML")
+        await message.answer(
+            "⚠ Format salah. Gunakan format:\n<code>email|password|kode_akses</code>", 
+            parse_mode="HTML",
+            reply_markup=get_main_menu_button()
+        )
         return
 
     email, password, access_code = parts[0], parts[1], parts[2]
@@ -210,46 +215,35 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
 
     try:
         pw = await async_playwright().start()
-        # Daftar User-Agent perangkat seluler (iPhone / Android) yang valid dan natural
-        mobile_user_agents = [
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-            "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-        ]
-        
-        selected_ua = random.choice(mobile_user_agents)
-
-        # Meluncurkan browser dengan argumen tambahan untuk menghindari deteksi bot di VPS
         browser = await pw.chromium.launch(
-            headless=True,
+            headless=HEADLESS_MODE,
             args=[
+                "--disable-blink-features=AutomationControlled", 
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu",
+                "--disable-accelerated-2d-canvas",
+                "--no-first-run",
+                "--no-zygote",
                 "--disable-infobars",
-                "--window-size=390,844",
-                "--disable-blink-features=AutomationControlled", # Mencegah deteksi properti webdriver
+                "--window-size=1280,720",
+                "--lang=en-US,en",
+                # Tambahan baru untuk VPS Headless:
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-extensions",
+                "--disable-features=IsolateOrigins,site-per-process"
             ]
         )
-
-        # Membuat context dengan emulasi perangkat seluler (Mobile Viewport & Touch)
         context = await browser.new_context(
-            user_agent=selected_ua,
-            viewport={'width': 390, 'height': 844},
-            device_scale_factor=3,
-            is_mobile=True,
-            has_touch=True,
-            locale="en-GB",
-            timezone_id="Europe/London"
+            storage_state=None,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36", 
+            locale="en-US",
+            ignore_https_errors=True,
+            viewport={'width': 1280, 'height': 720},
+            java_script_enabled=True
         )
-
-        # Menyuntikkan script JS untuk menyembunyikan jejak otomatisasi (navigator.webdriver)
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-        """)
+        await context.clear_cookies()
         page = await context.new_page()
 
         ACTIVE_BROWSER_SESSIONS[chat_id] = {
@@ -260,16 +254,23 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
             "email": email,
             "password": password
         }
-
-        await append_progress("🚀 Memulai browser...")
-        await append_progress("🔵 Login ke Disney+...")
-
-        login_res = await login_disney(page, context, email, password, progress_cb=append_progress)
+        tg_user_info = {
+            "id": message.from_user.id,
+            "username": message.from_user.username,
+            "full_name": message.from_user.full_name
+        }
+        login_res = await login_disney(page, context, email, password, progress_cb=append_progress, is_chpass = False, telegram_user=tg_user_info)
         if login_res["status"] != "success":
             logs.append(f"❌ Gagal: {login_res.get('message')}")
-            await status_msg.edit_text(render_code_block(logs), parse_mode="Markdown")
+            await status_msg.edit_text(
+                render_code_block(logs), 
+                parse_mode="Markdown",
+                reply_markup=get_main_menu_button()
+            )
+            await log_activity(chat_id, "LOOKUP_DEVICES", email, "FAILED", login_res.get('message'))
             await close_session(chat_id)
             return
+
 
         profile_selector = '[data-testid="profile-item"], .profile-avatar, [data-testid="profile-avatar"], button[aria-label*="Profile"]'
         try:
@@ -298,7 +299,11 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
 
     except Exception as e:
         logs.append(f"❌ Gagal: {str(e)}")
-        await status_msg.edit_text(render_code_block(logs), parse_mode="Markdown")
+        await status_msg.edit_text(
+            render_code_block(logs), 
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_button()
+        )
         await close_session(chat_id)
 
 
@@ -315,7 +320,10 @@ async def handle_toggle_device(callback: types.CallbackQuery, state: FSMContext)
     chat_id = callback.message.chat.id
     sess = ACTIVE_BROWSER_SESSIONS.get(chat_id)
     if not sess:
-        await callback.message.edit_text("❌ Sesi telah expired. Silakan masukkan perintah lookup ulang.")
+        await callback.message.edit_text(
+            "❌ Sesi telah expired. Silakan masukkan perintah lookup ulang.",
+            reply_markup=get_main_menu_button()
+        )
         return
 
     data = await state.get_data()
@@ -353,101 +361,98 @@ async def handle_execute_kick(callback: types.CallbackQuery, state: FSMContext):
     sess = ACTIVE_BROWSER_SESSIONS.get(chat_id)
 
     if not sess:
-        await callback.message.edit_text("❌ Sesi browser telah kadaluarsa. Silakan masukkan perintah lookup ulang.")
+        await callback.message.edit_text(
+            "❌ Sesi browser telah kadaluarsa. Silakan masukkan perintah lookup ulang.",
+            reply_markup=get_main_menu_button()
+        )
         return
 
     data = await state.get_data()
-    selected_indices = list(data.get("selected_indices", []))
     logs = data.get("logs", [])
     action_type = callback.data
 
-    async def append_kick_progress(step_text: str):
-        logs.append(step_text)
+    # LOGIKA KICK ALL: Pilih/centang semua perangkat (kecuali current device) lalu perbarui tampilan UI
+    if action_type == "action_kick_all":
+        all_non_current_indices = {d["index"] for d in sess["devices"] if not d["is_current"]}
+        await state.update_data(selected_indices=all_non_current_indices)
+
+        device_text, reply_markup = build_device_view(sess["devices"], all_non_current_indices)
+        full_message = f"{render_code_block(logs)}\n\n{device_text}"
+
+        try:
+            await callback.message.edit_text(full_message, parse_mode="Markdown", reply_markup=reply_markup)
+        except Exception:
+            pass
+        return
+
+    # LOGIKA KICK SELECTED: Menghapus satu per satu perangkat yang sudah dicentang
+    page = sess["page"]
+    email = sess["email"]
+    initial_devices = sess["devices"]
+    selected_indices = list(data.get("selected_indices", []))
+    kicked_list = []
+
+    # Fungsi penyesuaian agar teks progress mengupdate baris terakhir (tidak nambah sebaris-sebaris)
+    async def update_kick_progress(step_text: str, is_new: bool = False):
+        if is_new or not logs:
+            logs.append(step_text)
+        else:
+            logs[-1] = step_text  # Ubah baris terakhir secara dinamis
+            
         try:
             await callback.message.edit_text(render_code_block(logs), parse_mode="Markdown")
         except Exception:
             pass
 
-    page = sess["page"]
-    email = sess["email"]
-    initial_devices = sess["devices"]
-    kicked_list = []
-
     try:
-        if action_type == "action_kick_all":
-            await append_kick_progress("⏳ Menemukan & mengklik tombol 'log out of all devices'...")
+        sorted_targets = sorted(selected_indices, reverse=True)
+        total_targets = len(sorted_targets)
 
-            kick_all_anchor = 'a[data-testid="anchor-link"]:has-text("log out of all devices"), a:has-text("log out of all devices")'
-            await page.wait_for_selector(kick_all_anchor, timeout=10000)
+        for i, target_idx in enumerate(sorted_targets, 1):
+            # Baris pertama buat progres baru (is_new=True), selanjutnya menimpa baris tersebut
+            await update_kick_progress(f"⏳ Mengeluarkan perangkat... ({i}/{total_targets})", is_new=(i == 1))
 
-            # Klik link & tangkap tab baru yang terbuka
-            context = sess["context"]
-            async with context.expect_page() as popup_info:
-                await page.click(kick_all_anchor, force=True)
+            dev_info = next((d for d in initial_devices if d["index"] == target_idx), None)
+            current_cards = await page.query_selector_all('[data-testid^="device-details-"]')
+            
+            matched_card = None
+            if dev_info:
+                for card in current_cards:
+                    type_el = await card.query_selector('[data-testid="device-type"] span')
+                    loc_el = await card.query_selector('[data-testid="device-location"] span')
+                    
+                    card_type = await type_el.inner_text() if type_el else ""
+                    card_loc = await loc_el.inner_text() if loc_el else ""
 
-            popup_page = await popup_info.value
+                    if card_type == dev_info["type"] and card_loc == dev_info["location"]:
+                        matched_card = card
+                        break
 
-            # Jalankan alur login & kick di tab baru yang ditangkap
-            success = await process_kick_all_in_new_tab(popup_page, email, sess["password"], append_kick_progress)
+            if not matched_card and (target_idx - 1) < len(current_cards):
+                matched_card = current_cards[target_idx - 1]
 
-            if success:
-                await append_kick_progress("✅ Berhasil keluar dari semua perangkat!")
-            else:
-                await append_kick_progress("⚠️ Proses Kick All di tab baru menemui kendala.")
+            if matched_card:
+                remove_btn = await matched_card.query_selector('[data-testid="remove-btn"]')
+                if remove_btn:
+                    await remove_btn.click(force=True)
+                    await page.wait_for_timeout(1500)
 
-            # Tutup tab baru setelah selesai
-            try:
-                await popup_page.close()
-            except Exception:
-                pass
-        else:
-            sorted_targets = sorted(selected_indices, reverse=True)
-            total_targets = len(sorted_targets)
+                    # Klik Modal Log Out berdasarkan selector persis: data-testid="modal-primary-button"
+                    confirm_btn = 'button[data-testid="modal-primary-button"]'
+                    try:
+                        if await page.is_visible(confirm_btn, timeout=4000):
+                            await page.click(confirm_btn, force=True)
+                            await page.wait_for_timeout(2000)
+                    except Exception:
+                        pass
 
-            for i, target_idx in enumerate(sorted_targets, 1):
-                await append_kick_progress(f"⏳ Mengeluarkan perangkat... ({i}/{total_targets})")
+                    # Cek apakah setelah modal Log Out Disney meminta verifikasi OTP
+                    await handle_otp_if_required(page, email, update_kick_progress)
 
-                dev_info = next((d for d in initial_devices if d["index"] == target_idx), None)
-                current_cards = await page.query_selector_all('[data-testid^="device-details-"]')
-                
-                matched_card = None
-                if dev_info:
-                    for card in current_cards:
-                        type_el = await card.query_selector('[data-testid="device-type"] span')
-                        loc_el = await card.query_selector('[data-testid="device-location"] span')
-                        
-                        card_type = await type_el.inner_text() if type_el else ""
-                        card_loc = await loc_el.inner_text() if loc_el else ""
+                    if dev_info:
+                        kicked_list.append(dev_info)
 
-                        if card_type == dev_info["type"] and card_loc == dev_info["location"]:
-                            matched_card = card
-                            break
-
-                if not matched_card and (target_idx - 1) < len(current_cards):
-                    matched_card = current_cards[target_idx - 1]
-
-                if matched_card:
-                    remove_btn = await matched_card.query_selector('[data-testid="remove-btn"]')
-                    if remove_btn:
-                        await remove_btn.click(force=True)
-                        await page.wait_for_timeout(1500)
-
-                        # Klik Modal Log Out berdasarkan selector persis: data-testid="modal-primary-button"
-                        confirm_btn = 'button[data-testid="modal-primary-button"]'
-                        try:
-                            if await page.is_visible(confirm_btn, timeout=4000):
-                                await page.click(confirm_btn, force=True)
-                                await page.wait_for_timeout(2000)
-                        except Exception:
-                            pass
-
-                        # Cek apakah setelah modal Log Out Disney meminta verifikasi OTP
-                        await handle_otp_if_required(page, email, append_kick_progress)
-
-                        if dev_info:
-                            kicked_list.append(dev_info)
-
-            await append_kick_progress("✅ Selesai!")
+        await update_kick_progress("✅ Selesai!")
 
         # Ambil kondisi perangkat tersisa setelah proses selesai
         await page.wait_for_timeout(2000)
@@ -457,11 +462,7 @@ async def handle_execute_kick(callback: types.CallbackQuery, state: FSMContext):
         report = "Selesai (Kick Device)\n\n"
         report += f" Email: {sess['email']}\n"
         report += f" Password: {sess['password']}\n"
-        
-        if action_type == "action_kick_all":
-            report += f" Devices kicked: {len(initial_devices) - len(remaining_devices)}/{len(initial_devices)}\n\n"
-        else:
-            report += f" Devices kicked: {len(kicked_list)}/{len(selected_indices)}\n\n"
+        report += f" Devices kicked: {len(kicked_list)}/{len(selected_indices)}\n\n"
 
         if kicked_list:
             report += "Kicked:\n"
@@ -475,17 +476,29 @@ async def handle_execute_kick(callback: types.CallbackQuery, state: FSMContext):
                 report += f"   CURRENT DEVICE - {r['type']} - {r['location']}\n"
             else:
                 report += f"   {r['type']} - {r['location']} — {r['time']}\n"
-
-        await callback.message.edit_text(f"```\n{report}\n```", parse_mode="Markdown")
-
+        await callback.message.edit_text(
+            f"```\n{report}\n```", 
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_button()
+        )
+        await log_activity(
+            telegram_id=chat_id,
+            action="KICK_DEVICES",
+            email=sess['email'],
+            status="SUCCESS",
+            details=f"Kicked {len(kicked_list)} devices"
+        )
     except Exception as e:
         logs.append(f"❌ Gagal: {str(e)}")
-        await callback.message.edit_text(render_code_block(logs), parse_mode="Markdown")
-
+        await callback.message.edit_text(
+            render_code_block(logs), 
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_button()
+        )
+        await log_activity(chat_id, "KICK_DEVICES", sess.get('email', ''), "FAILED", str(e))
     finally:
         await close_session(chat_id)
         await state.clear()
-
 
 # =========================================================================
 # 4. CANCEL & IGNORING
@@ -495,7 +508,10 @@ async def handle_cancel_lookup(callback: types.CallbackQuery, state: FSMContext)
     chat_id = callback.message.chat.id
     await close_session(chat_id)
     await state.clear()
-    await callback.message.edit_text("❌ Proses Lookup Device dibatalkan.")
+    await callback.message.edit_text(
+        "❌ Proses Lookup Device dibatalkan.",
+        reply_markup=get_main_menu_button()
+    )
 
 @router.callback_query(F.data == "ignore_current")
 async def handle_ignore_current(callback: types.CallbackQuery):

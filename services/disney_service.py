@@ -4,19 +4,76 @@ from typing import Callable, Awaitable, Optional, Dict
 from playwright.async_api import async_playwright
 from config.settings import HEADLESS_MODE
 from services.imap_service import fetch_disney_otp
+from database.db import log_activity, upsert_user, update_account_password
+
+change_pass_btn = 'button[data-testid="change-password"], [data-testid="change-password"]'
+enter_pass_btn = 'button[data-testid="enter-password-button"]'
+send_passcode_btn = 'button[data-testid="send-passcode-button"]'
+password_selector = 'input[data-testid="password"], input[type="password"], #password'
+submit_btn = 'button[data-testid="id-flow-submit"], #id-flow, button[type="submit"]'
+redeem_btn = 'button[data-testid="redeem-otp"], button[type="submit"]'
+
+async def get_element(page, selector: str, timeout: int = 20000):
+    end_time = asyncio.get_event_loop().time() + (timeout / 1000)
+    while asyncio.get_event_loop().time() < end_time:
+        try:
+            el = page.locator(selector).first
+            if await el.is_visible():
+                return el, page
+        except Exception:
+            pass
+        for frame in page.frames:
+            try:
+                el = frame.locator(selector).first
+                if await el.is_visible():
+                    return el, frame
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
+    raise Exception(f"Timeout {timeout}ms mencari selector: {selector}")
+async def fill_otp_code_and_sync(page,scope, otp_code: str):
+    """Mengisi 6 digit OTP dan memaksa React/Bootstrap membaca value-nya"""
+    for i in range(6):
+        inp_selector = f'#otp-code-input-otpCode-{i}'
+        inp = scope.locator(inp_selector).first
+        await inp.focus()
+        await inp.fill(otp_code[i])
+        # Tembakkan event JS agar React State membaca perubahan nilai
+        await inp.dispatch_event('input')
+        await inp.dispatch_event('change')
+        await asyncio.sleep(0.05)
+    # Jalankan evaluasi JS langsung dari scope (Bisa Page atau Frame)
+    eval_script = """
+        (otp) => {
+            const container = document.querySelector('[data-testid="otpCode"]');
+            const hiddenInput = document.querySelector('input[type="hidden"][name="otpCode"]');
+            const form = document.querySelector('#otp-recovery') || document.querySelector('[data-testid="otp-redeem-form"]');
+            
+            if (container) container.setAttribute('value', otp);
+            if (hiddenInput) hiddenInput.value = otp;
+            
+            // Hapus status invalid dari Form
+            if (form) {
+                form.classList.remove('is-invalid');
+            }
+        }
+    """
+    # Eksekusi dengan mengirimkan argument otp_code secara aman
+    if hasattr(scope, "evaluate"):
+        await scope.evaluate(eval_script, otp_code)
+    else:
+        await page.evaluate(eval_script, otp_code)
+    await page.wait_for_timeout(500)
 
 
-async def login_disney(page, context, email: str, password: str, progress_cb: Callable[[str], Awaitable[None]] = None):
+async def login_disney(page, context, email: str, password: str, progress_cb: Callable[[str], Awaitable[None]] = None, is_chpass = False, telegram_user: Optional[Dict] = None):  
     if progress_cb:
-        await progress_cb("🌐 Memulai browser…")
-
-    await context.clear_cookies()
-    
-    if progress_cb:
-        await progress_cb("🔑 Membuka halaman login…")
-    
+        await progress_cb("🚀 Memulai browser...")
     await page.goto("https://www.disneyplus.com/en-gb/identity/login", wait_until="domcontentloaded")
     await page.wait_for_timeout(6000)
+    
+    if progress_cb:
+        await progress_cb("🔵 Login ke Disney+...")
 
     if progress_cb:
         await progress_cb("📧 Mengisi email…")
@@ -43,33 +100,96 @@ async def login_disney(page, context, email: str, password: str, progress_cb: Ca
         return {"status": "error", "message": "Akun tidak terdaftar"}
 
     # 2. Cek Confirm Identity / OTP Requirement
-    enter_pass_btn = 'button[data-testid="enter-password-button"]'
-    if await page.is_visible('button[data-testid="send-passcode-button"]') or await page.is_visible(enter_pass_btn):
-        if await page.is_visible(enter_pass_btn):
+    if await page.is_visible(send_passcode_btn) or await page.is_visible(enter_pass_btn):
+        await page.wait_for_timeout(1000)
+        if is_chpass:
+            if progress_cb:
+                await progress_cb("📩 Menekan tombol Send Passcode…")
+
+            # 1. Klik tombol Send
+            try:
+                send_btn_elem, _ = await get_element(page, send_passcode_btn, timeout=10000)
+                await send_btn_elem.click(force=True)
+            except Exception:
+                await page.click('button[data-testid="send-passcode-button"]', force=True)
+
+            await page.wait_for_timeout(3000)
+
+            if progress_cb:
+                await progress_cb("📩 Mengambil kode OTP terbaru dari IMAP…")
+
+            # 2. Ambil OTP dari IMAP
+            request_time = time.time() - 10
+            otp_confirm = await fetch_disney_otp(email=email, max_wait_seconds=60, since_time=request_time)
+            if not otp_confirm:
+                return {"status": "error", "message": "Gagal mendapatkan OTP Konfirmasi IMAP"}
+
+            # 3. Tunggu input pertama OTP benar-benar siap & visible
+            first_input_selector = '#otp-code-input-otpCode-0'
+            await page.wait_for_selector(first_input_selector, state="visible", timeout=15000)
+            
+            first_input = page.locator(first_input_selector).first
+            await first_input.click(force=True)
+            await page.wait_for_timeout(300)
+
+            # 4. Ketik OTP angka demi angka menggunakan keyboardPlaywright murni (Trigger React State & Next.js secara alami)
+            for digit in str(otp_confirm):
+                await page.keyboard.press(digit)
+                await page.wait_for_timeout(150)
+
+            # 1. Pastikan reCAPTCHA Enterprise v3 sudah selesai memproses atau jalankan eksekusi token secara eksplisit
+            await page.evaluate("""
+                async () => {
+                    if (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {
+                        return new Promise((resolve) => {
+                            grecaptcha.enterprise.ready(async () => {
+                                try {
+                                    // Palang atau ambil token reCAPTCHA untuk action redeem/submit
+                                    const token = await grecaptcha.enterprise.execute('6Lcx8hUtAAAAAA3X3cEnP2NXw35jJutlVQ_Fb1Ln', {action: 'submit'});
+                                    // Masukkan token ke dalam form jika dibutuhkan, atau biarkan sistem menangkapnya
+                                    resolve(token);
+                                } catch (e) {
+                                    resolve(null);
+                                }
+                            });
+                        });
+                    }
+                }
+            """)
+
+            # 2. Berikan jeda sejenak setelah reCAPTCHA siap
+            await page.wait_for_timeout(1000)
+
+            # 3. Klik tombol Continue / Redeem OTP menggunakan evaluasi DOM JavaScript
+            await page.evaluate("""
+                const btn = document.querySelector('button[data-testid="redeem-otp"]');
+                if (btn) {
+                    btn.removeAttribute('disabled');
+                    btn.focus();
+                    btn.click();
+                }
+            """)
+
+            await page.wait_for_timeout(10000)
+
+        elif await page.is_visible(enter_pass_btn):
             await page.click(enter_pass_btn)
             await page.wait_for_timeout(2000)
+            # 3. Isi Password & Submit
+            if progress_cb:
+                await progress_cb("🔑 Memasukkan password akun…")
+                
+            password_selector = 'input[data-testid="password"], input[type="password"], #password'
+            await page.wait_for_selector(password_selector, state="visible", timeout=10000)
+            await page.fill(password_selector, password)
+            await page.click(submit_btn)
         else:
-            if progress_cb:
-                await progress_cb("📩 Meminta kode OTP…")
-            otp = await fetch_disney_otp(email)
-            if not otp:
-                return {"status": "error", "message": "Gagal menerima OTP IMAP"}
-            
-            if progress_cb:
-                await progress_cb("🔓 Memasukkan OTP login…")
+            return {"status": "error", "message": "User not verified"}
 
-    # 3. Isi Password & Submit
-    if progress_cb:
-        await progress_cb("🔑 Memasukkan password akun…")
-        
-    password_selector = 'input[data-testid="password"], input[type="password"], #password'
-    await page.wait_for_selector(password_selector, state="visible", timeout=10000)
-    await page.fill(password_selector, password)
-    await page.click(submit_btn)
 
     # 4. MENUNGGU "WHO'S WATCHING" & KLIK PROFIL
     if progress_cb:
-        await progress_cb("👤 Menunggu layar Who's Watching…")
+        await progress_cb("👤 Menunggu Autentikasi User…")
 
     profile_card_selector = (
         '[data-testid="profile-avatar"], [data-testid="profile-item"], '
@@ -77,639 +197,797 @@ async def login_disney(page, context, email: str, password: str, progress_cb: Ca
     )
 
     try:
-        # Tunggu avatar profil muncul
+        # Tunggu avatar profil muncul (gunakan state="visible" agar elemen benar-benar siap render)
         await page.wait_for_selector(profile_card_selector, state="visible", timeout=35000)
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(2000)
 
         if progress_cb:
             await progress_cb("👇 Mengklik profil utama…")
             
         first_profile = page.locator(profile_card_selector).first
         
-        # Paksa klik pada element profil
-        await first_profile.click(force=True)
-
-        # Cek dan tunggu sampai URL berpindah dari layar login/select-profile ke halaman home Disney
+        # Coba klik dengan force, jika gagal fallback ke evaluasi JS
         try:
-            await page.wait_for_url("**/home**", timeout=15000)
+            await first_profile.click(force=True, timeout=5000)
         except Exception:
-            # Jika URL tidak berubah otomatis, tunggu beberapa detik agar token session tersimpan
-            await page.wait_for_timeout(4000)
+            await page.evaluate(f"""
+                const profile = document.querySelector('{profile_card_selector}');
+                if (profile) profile.click();
+            """)
 
-    except Exception:
-        # Jika gagal masuk/klik profil, cek apakah password salah
+        # Tunggu perpindahan URL ke halaman home atau dashboard utama
+        try:
+            await page.wait_for_url("**/home**", timeout=20000)
+        except Exception:
+            # Jika URL tidak mengandung /home tapi proses sudah berjalan, biarkan lanjut asal tidak error
+            pass
+
+        if telegram_user and "id" in telegram_user:
+            await upsert_user(
+                telegram_id=telegram_user["id"],
+                username=telegram_user.get("username"),
+                full_name=telegram_user.get("full_name"),
+                role="customer"
+            )
+        return {"status": "success", "message": "Login berhasil"}
+
+    except Exception as e:
         if await page.is_visible(password_selector) or await page.is_visible('.invalid-feedback'):
             return {"status": "error", "message": "Password salah"}
+        
+        return {"status": "error", "message": f"Gagal melewati layar profil: {str(e)}"}
 
+async def login_mydisney(page, target_email: str, progress_cb: Callable[[str], Awaitable[None]] = None, is_chpass = False, telegram_user: Optional[Dict] = None):
+    # 1. Membuka halaman utama MyDisney
+    
+    await progress_cb("🚀 Memulai browser...")
+    await page.goto("https://my.disney.com/", wait_until="domcontentloaded", timeout=30000)
+
+    # 2. Klik tombol 'Masuk'
+    btn_login = page.locator("#sign_in")
+    await btn_login.wait_for(state="attached", timeout=20000)
+    await btn_login.click()
+
+    # 3. Tunggu transisi ke login.disney.com
+    
+    await progress_cb("🔵 Login ke MyDisney...")
+    await page.wait_for_url(lambda url: "login.disney.com" in url, timeout=20000)
+
+    # 4. Tunggu Input Email muncul
+    email_selector = '#lookupValue, input[data-testid="lookupValue"], input[name="lookupValue"]'
+    email_input = page.locator(email_selector).first
+
+    await email_input.wait_for(state="visible", timeout=30000)
+
+    await email_input.click()
+    await progress_cb("📧 Mengisi email…")
+    await email_input.fill(target_email)
+    await page.wait_for_timeout(500)
+    await email_input.press("Enter")
+    
+    
+
+    # --- HANDLER ALUR VERIFIKASI & MODAL KONFIRMASI ---
+    btn_recovery = page.locator("#account-recovery")
+    btn_send_code = page.locator('button[data-testid="send-passcode-button"]')
+    first_input_selector = "#otp-code-input-otpCode-0"
+
+    # Skenario A: Jika terdeteksi halaman Password -> Klik "Kesulitan masuk?"
+    try:
+        await page.wait_for_selector(
+            '#account-recovery, button[data-testid="send-passcode-button"], #otp-code-input-otpCode-0',
+            timeout=15000,
+        )
+    except Exception:
+        pass
+
+    if await btn_recovery.is_visible():
+        await btn_recovery.click()
+        await page.wait_for_timeout(2000)
+
+    # Skenario B: Klik Tombol 'Kirim Email' jika modal konfirmasi / pilihan cara verifikasi muncul
+    otp_request_timestamp = time.time()
+
+    if await btn_send_code.is_visible():
+        otp_request_timestamp = time.time()
+        await btn_send_code.click()
+
+        await page.wait_for_selector(first_input_selector, state="visible", timeout=20000)
+    else:
+
+        btn_choose_delivery = page.locator("#choose-delivery-method")
+        await btn_choose_delivery.wait_for(state="visible", timeout=15000)
+
+        # Catat timestamp Unix (dalam detik, presisi float)
+        otp_request_timestamp = time.time()
+        await btn_choose_delivery.click()
+
+        await page.wait_for_selector(first_input_selector, state="visible", timeout=20000)
+
+        await page.wait_for_timeout(4000)
+
+    # 5. Ambil OTP via IMAP Service Python
+    await progress_cb("📩 Mengambil kode OTP terbaru dari IMAP…")
+    otp_code = await fetch_disney_otp(
+        email=target_email, 
+        max_wait_seconds=45, 
+        interval=3, 
+        since_time=otp_request_timestamp
+    )
+
+    if not otp_code:
+        raise Exception("Gagal mendapatkan kode OTP dari email via IMAP!")
+
+
+    # 6. INPUT OTP DENGAN CARA FILL PER-BOX
+    otp_digits = list(otp_code)
+
+    for i in range(6):
+        box_locator = page.locator(f"#otp-code-input-otpCode-{i}")
+        await box_locator.wait_for(state="visible", timeout=5000)
+        await box_locator.focus()
+        await box_locator.fill(otp_digits[i])
+        # Trigger event input & change bawaan DOM React via JavaScript
+        await box_locator.dispatch_event("input")
+        await box_locator.dispatch_event("change")
+        await page.wait_for_timeout(100)
+
+    await page.wait_for_timeout(1000)
+
+    # 7. EKSEKUSI RECAPTCHA & SUBMIT OTP MENGGUNAKAN REDEEM BUTTON  
+    await page.evaluate("""
+        async () => {
+            if (typeof grecaptcha !== 'undefined' && grecaptcha.enterprise) {
+                return new Promise((resolve) => {
+                    grecaptcha.enterprise.ready(async () => {
+                        try {
+                            const token = await grecaptcha.enterprise.execute('6Lcx8hUtAAAAAA3X3cEnP2NXw35jJutlVQ_Fb1Ln', {action: 'submit'});
+                            resolve(token);
+                        } catch (e) {
+                            resolve(null);
+                        }
+                    });
+                });
+            }
+        }
+    """)
+    await page.wait_for_timeout(1000)
+
+    # Klik tombol redeem/continue OTP spesifik milik MyDisney
+    submit_success = await page.evaluate("""
+        () => {
+            // Cari tombol dengan data-testid redeem-otp atau continue
+            const btn = document.querySelector('button[data-testid="redeem-otp"]') || 
+                        document.querySelector('button[data-testid="continue-button"]') ||
+                        document.querySelector('button[type="submit"]');
+            if (btn) {
+                btn.removeAttribute('disabled');
+                btn.click();
+                return true;
+            }
+            return false;
+        }
+    """)
+
+    if not submit_success:
+        await page.keyboard.press("Enter")
+
+
+    if telegram_user and "id" in telegram_user:
+        await upsert_user(
+            telegram_id=telegram_user["id"],
+            username=telegram_user.get("username"),
+            full_name=telegram_user.get("full_name"),
+            role="customer"
+        )
     return {"status": "success", "message": "Login berhasil"}
 
-async def change_disney_password(email: str, current_password: str, new_password: str, progress_cb: Callable[[str], Awaitable[None]] = None):
-    """FUNGSI GANTI PASSWORD DISNEY PLUS"""
+async def change_password_mydisney(
+    email: str,
+    new_password: str,
+    progress_cb: Callable[[str], Awaitable[None]] = None,
+    telegram_user: Optional[Dict] = None,
+    keep_open: bool = False
+):
+    tg_id = telegram_user.get("id") if telegram_user else None
+
+    async def progress(message: str):
+        if progress_cb:
+            await progress_cb(message)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=HEADLESS_MODE, 
+            headless=HEADLESS_MODE,
             args=[
-                "--disable-blink-features=AutomationControlled", 
+                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
-                "--no-first-run",
-                "--no-zygote",
-                "--disable-infobars",
-                "--window-size=1280,720",
-                "--lang=en-US,en",
-                # Tambahan baru untuk VPS Headless:
                 "--disable-gpu",
-                "--disable-software-rasterizer",
-                "--disable-extensions",
-                "--disable-features=IsolateOrigins,site-per-process"
+                "--window-size=1280,720"
             ]
         )
-
-        # 2. Buat Browser Context BARU yang terisolasi
         context = await browser.new_context(
-            storage_state=None,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36", 
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             locale="en-US",
-            ignore_https_errors=True,
-            viewport={'width': 1280, 'height': 720},
-            java_script_enabled=True
+            viewport={"width": 1280, "height": 720}
         )
-
-        # 3. Pastikan Cookies & Storage kosong
         await context.clear_cookies()
-        
         page = await context.new_page()
-
         try:
-            # 1. Login
-            login_res = await login_disney(page, context, email, current_password, progress_cb)
-            if login_res["status"] != "success":
+            login_res = await login_mydisney(
+                page,
+                email,
+                progress,
+                is_chpass=True,
+                telegram_user=telegram_user
+            )
+            if login_res.get("status") != "success":
                 return login_res
+            
 
-            async def get_element(selector: str, timeout: int = 20000):
-                end_time = asyncio.get_event_loop().time() + (timeout / 1000)
-                while asyncio.get_event_loop().time() < end_time:
+            await progress("🔐 Login berhasil...")
+
+            # 1. Definisikan Selector untuk kedua skenario
+            # Skenario A: Halaman Konfirmasi Login / Recovery Complete
+            recovery_reset_btn = page.locator('#recovery-reset, button[data-testid="recovery-reset"]')
+
+            # Skenario B: Card "Access & Security" di halaman Home / Dashboard
+            dashboard_change_pass_link = page.locator('a[href*="/edit/password"], a:has-text("Ubah kata sandi Anda"), a:has-text("Change your password")')
+
+            # 2. Tunggu salah satu dari kedua elemen ini muncul di DOM (Timeout 15 Detik)
+            try:
+                await page.wait_for_selector(
+                    '#recovery-reset, button[data-testid="recovery-reset"], a[href*="/edit/password"]',
+                    state="visible",
+                    timeout=20000
+                )
+            except Exception:
+                pass
+
+            # --- EKSEKUSI PENANGANAN SKENARIO DENGAN RETRY & VERIFIKASI ---
+
+            # Helper function untuk mengeklik dan memastikan halaman merespons
+            async def trigger_change_password():
+                # 1. Coba klik tombol konfirmasi SSO (#recovery-reset) jika ada
+                if await recovery_reset_btn.is_visible():
+                    await progress("⚡ Menekan 'Ubah Kata Sandi' (Halaman Konfirmasi SSO)...")
                     try:
-                        el = page.locator(selector).first
-                        if await el.is_visible():
-                            return el, page
+                        await recovery_reset_btn.click(force=True)
                     except Exception:
-                        pass
-                    for frame in page.frames:
-                        try:
-                            el = frame.locator(selector).first
-                            if await el.is_visible():
-                                return el, frame
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.5)
-                raise Exception(f"Timeout {timeout}ms mencari selector: {selector}")
+                        await page.evaluate("""() => {
+                            const btn = document.querySelector('#recovery-reset') || document.querySelector('button[data-testid="recovery-reset"]');
+                            if (btn) btn.click();
+                        }""")
+                    return True
 
-            # PERBAIKAN: Sync React State yang aman dari Frame & Bebas Bug Sintaks JS
-            async def fill_otp_code_and_sync(scope, otp_code: str):
-                """Mengisi 6 digit OTP dan memaksa React/Bootstrap membaca value-nya"""
-                for i in range(6):
-                    inp_selector = f'#otp-code-input-otpCode-{i}'
-                    inp = scope.locator(inp_selector).first
-                    await inp.focus()
-                    await inp.fill(otp_code[i])
-                    # Tembakkan event JS agar React State membaca perubahan nilai
-                    await inp.dispatch_event('input')
-                    await inp.dispatch_event('change')
-                    await asyncio.sleep(0.05)
+                # 2. Coba klik link di Dashboard jika ada
+                dash_link = page.locator('a[href*="/edit/password"], a:has-text("Change your password"), a:has-text("Ubah kata sandi")').first
+                if await dash_link.is_visible():
+                    await progress("📌 Menekan link 'Change your password' di Dashboard...")
+                    try:
+                        # Scroll ke elemen & pastikan dapat diklik
+                        await dash_link.scroll_into_view_if_needed()
+                        await page.wait_for_timeout(500)
+                        await dash_link.click(force=True)
+                    except Exception:
+                        await page.evaluate("""() => {
+                            const link = document.querySelector('a[href*="/edit/password"]') || 
+                                         Array.from(document.querySelectorAll('a')).find(el => 
+                                            el.textContent.includes('Change your password') || 
+                                            el.textContent.includes('Ubah kata sandi')
+                                         );
+                            if (link) link.click();
+                        }""")
+                    return True
 
-                # Jalankan evaluasi JS langsung dari scope (Bisa Page atau Frame)
-                eval_script = """
-                    (otp) => {
-                        const container = document.querySelector('[data-testid="otpCode"]');
-                        const hiddenInput = document.querySelector('input[type="hidden"][name="otpCode"]');
-                        const form = document.querySelector('#otp-recovery') || document.querySelector('[data-testid="otp-redeem-form"]');
-                        
-                        if (container) container.setAttribute('value', otp);
-                        if (hiddenInput) hiddenInput.value = otp;
-                        
-                        // Hapus status invalid dari Form
-                        if (form) {
-                            form.classList.remove('is-invalid');
-                        }
-                    }
-                """
+                return False
+
+            # Jalankan percobaan klik dengan perulangan (Retry sampai 3 kali)
+            navigated = False
+            for attempt in range(1, 4):
+                await trigger_change_password()
                 
-                # Eksekusi dengan mengirimkan argument otp_code secara aman
-                if hasattr(scope, "evaluate"):
-                    await scope.evaluate(eval_script, otp_code)
-                else:
-                    await page.evaluate(eval_script, otp_code)
-
-                await page.wait_for_timeout(500)
-
-            async def handle_choose_delivery_if_present():
-                choose_btn_selector = '#choose-delivery-method, button[id="choose-delivery-method"]'
+                # Cek apakah indikator halaman berikutnya (#choose-delivery-method atau input OTP) sudah muncul
                 try:
-                    elem, active_scope = await get_element(choose_btn_selector, timeout=4000)
-                    if elem:
-                        if progress_cb:
-                            await progress_cb("📩 Menekan tombol 'Send' untuk mengirim OTP…")
-                        await elem.click(force=True)
-                        await page.wait_for_timeout(3000)
-                        return True
+                    await page.wait_for_selector(
+                        '#choose-delivery-method, #otp-code-input-otpCode-0, #recovery-reset',
+                        state="visible",
+                        timeout=4000
+                    )
+                    navigated = True
+                    break
+                except Exception:
+                    await progress(f"⏳ Menunggu transisi ke form ubah password (percobaan {attempt}/3)...")
+                    await page.wait_for_timeout(1500)
+
+            # FALLBACK DARURAT: Jika klik di UI gagal akibat hydration lock Next.js
+            if not navigated:
+                await progress("🔄 Event UI tidak merespons, mengeksekusi navigasi langsung via href...")
+                target_href = await page.evaluate("""() => {
+                    const link = document.querySelector('a[href*="/edit/password"]');
+                    return link ? link.getAttribute('href') : null;
+                }""")
+                if target_href:
+                    # Jika href berupa path relatif, gabungkan dengan origin
+                    full_url = target_href if target_href.startswith("http") else f"https://my.disney.com{target_href}"
+                    await page.goto(full_url, wait_until="domcontentloaded", timeout=15000)
+                else:
+                    await page.goto("https://my.disney.com/edit/password", wait_until="domcontentloaded", timeout=15000)
+
+            # Beri jeda stabilisasi akhir
+            await page.wait_for_timeout(2000)
+
+            choose_delivery_selector = "#choose-delivery-method"
+            otp_request_timestamp = time.time()
+            try:
+                await page.wait_for_selector(
+                    choose_delivery_selector,
+                    state="visible",
+                    timeout=15000
+                )
+            except Exception:
+                otp_first = page.locator("#otp-code-input-otpCode-0")
+                if not await otp_first.is_visible():
+                    raise Exception("Tombol #choose-delivery-method tidak ditemukan.")
+            else:
+                choose_delivery_btn = page.locator(choose_delivery_selector)
+                await progress("📧 Mengirim kode verifikasi Ubah Password...")
+                await choose_delivery_btn.click(force=True)
+                await page.wait_for_timeout(1500)
+            first_otp_selector = "#otp-code-input-otpCode-0"
+            await page.wait_for_selector(
+                first_otp_selector,
+                state="visible",
+                timeout=20000
+            )
+            otp_code = await fetch_disney_otp(
+                email=email,
+                max_wait_seconds=45,
+                interval=3,
+                since_time=otp_request_timestamp
+            )
+            if not otp_code:
+                raise Exception("Gagal mendapatkan kode OTP dari email via IMAP.")
+            otp_code = str(otp_code).strip()
+            if not otp_code.isdigit():
+                raise Exception(f"OTP tidak valid: {otp_code}")
+            if len(otp_code) != 6:
+                raise Exception(f"OTP harus 6 digit, tetapi menerima: {otp_code}")
+            otp_digits = list(otp_code)
+            for i in range(6):
+                box_locator = page.locator(f"#otp-code-input-otpCode-{i}")
+                await box_locator.wait_for(state="visible", timeout=5000)
+                await box_locator.focus()
+                await box_locator.fill(otp_digits[i])
+                await box_locator.dispatch_event("input")
+                await box_locator.dispatch_event("change")
+                await page.wait_for_timeout(100)
+            await page.wait_for_timeout(1000)
+            await progress("🔓 Memverifikasi kode OTP...")
+            submit_success = await page.evaluate("""
+                () => {
+                    const btn =
+                        document.querySelector('button[data-testid="redeem-otp"]') ||
+                        document.querySelector('button[data-testid="continue-button"]') ||
+                        document.querySelector('button[type="submit"]');
+                    if (btn) {
+                        btn.removeAttribute("disabled");
+                        btn.click();
+                        return true;
+                    }
+                    return false;
+                }
+            """)
+            if not submit_success:
+                await page.keyboard.press("Enter")
+            await page.wait_for_timeout(3000)
+            btn_continue = page.locator(
+                '#recovery-continue, button[data-testid="continue-button"]'
+            )
+            try:
+                await btn_continue.wait_for(
+                    state="visible",
+                    timeout=10000
+                )
+                await progress("➡️ Melanjutkan ke pengaturan kata sandi...")
+                await btn_continue.click(force=True)
+                await page.wait_for_timeout(3000)
+            except Exception:
+                pass
+            new_password_selectors = [
+                "#password",
+                'input[name="password"]',
+                'input[type="password"]',
+                'input[data-testid="newPassword"]',
+                "#password-new",
+                'input[name="newPassword"]'
+            ]
+            new_pass_input = None
+            for selector in new_password_selectors:
+                locator = page.locator(selector).first
+                try:
+                    await locator.wait_for(
+                        state="visible",
+                        timeout=5000
+                    )
+                    new_pass_input = locator
+                    break
+                except Exception:
+                    continue
+            if new_pass_input is None:
+                try:
+                    html = await page.content()
+                    with open(
+                        "mydisney_password_debug.html",
+                        "w",
+                        encoding="utf-8"
+                    ) as f:
+                        f.write(html)
                 except Exception:
                     pass
-                return False
-
-            profile_selector = '[data-testid="profile-item"], .profile-avatar, [data-testid="profile-avatar"], button[aria-label*="Profile"]'
-
-            async def ensure_not_on_select_profile():
-                """Fungsi Penjaga: Hanya aktif jika belum berada di commerce/account"""
-                if ("select-profile" in page.url or "whos-watching" in page.url) and "commerce/account" not in page.url:
-                    if progress_cb:
-                        await progress_cb("⚠️ Terlempar balik ke Select Profile! Memilih profil ulang…")
-                    try:
-                        prof_elem, _ = await get_element(profile_selector, timeout=5000)
-                        await prof_elem.click(force=True)
-                        await page.wait_for_timeout(3000)
-                    except Exception:
-                        pass
-
-            # =========================================================================
-            # 2. SELESAIKAN PROSES SELECT PROFILE AWAL
-            # =========================================================================
-            if progress_cb:
-                await progress_cb("👤 Menunggu & Memilih Profil di layar Who's Watching…")
-
-            try:
-                profile_elem, _ = await get_element(profile_selector, timeout=20000)
-                await profile_elem.click(force=True)
-                await page.wait_for_timeout(3000)
-            except Exception:
-                pass
-
-            # =========================================================================
-            # 3. MENGAKSES COMMERCE/ACCOUNT PERTAMA KALI
-            # =========================================================================
-            if progress_cb:
-                await progress_cb("⚙️ Membuka menu Account & MyDisney…")
-
-            await ensure_not_on_select_profile()
-
-            if "commerce/account" not in page.url:
-                await page.goto("https://www.disneyplus.com/en-gb/commerce/account", wait_until="domcontentloaded", timeout=40000)
-                await page.wait_for_timeout(4000)
-
-            manage_btn_selector = 'button[data-testid="manage-email-and-password"], [data-testid="manage-email-and-password"], a[data-testid="manage-email-and-password"]'
-            
-            # Perpanjang timeout menjadi 30 detik untuk memberikan waktu iframe/DOM merender tombol
-            try:
-                manage_elem, active_scope = await get_element(manage_btn_selector, timeout=30000)
-            except Exception:
-                # Fallback: Jika tombol tidak ketemu, refresh/buka ulang halaman account
-                await page.reload(wait_until="domcontentloaded")
-                await page.wait_for_timeout(4000)
-                manage_elem, active_scope = await get_element(manage_btn_selector, timeout=20000)
-
-            await manage_elem.click(force=True)
-            await page.wait_for_timeout(4000)
-
-            # 4. HANDLING VERIFIKASI IDENTITAS TERLEBIH DAHULU
-            change_pass_btn = 'button[data-testid="change-password"], [data-testid="change-password"]'
-            enter_pass_btn = 'button[data-testid="enter-password-button"]'
-            send_passcode_btn = 'button[data-testid="send-passcode-button"]'
-            password_selector = 'input[data-testid="password"], input[type="password"], #password'
-            submit_btn = 'button[data-testid="id-flow-submit"], #id-flow, button[type="submit"]'
-            redeem_btn = 'button[data-testid="redeem-otp"], button[type="submit"]'
-
-            for _ in range(3):
-                if await page.locator(change_pass_btn).is_visible():
-                    break
-
-                await handle_choose_delivery_if_present()
-
-                if await page.locator(enter_pass_btn).is_visible() or await page.locator(send_passcode_btn).is_visible():
-                    if await page.locator(enter_pass_btn).is_visible():
-                        if progress_cb:
-                            await progress_cb("🔑 Konfirmasi identitas dengan Password saat ini…")
-                        await page.click(enter_pass_btn)
-                        await page.wait_for_timeout(2000)
-                        
-                        pass_field, active_scope = await get_element(password_selector, timeout=10000)
-                        await pass_field.fill(current_password)
-                        submit_confirm, _ = await get_element(submit_btn, timeout=10000)
-                        await submit_confirm.click()
-                        await page.wait_for_timeout(4000)
-
-                        await handle_choose_delivery_if_present()
-
-                    else:
-                        if progress_cb:
-                            await progress_cb("📩 Konfirmasi identitas dengan Email OTP…")
-                        await page.click(send_passcode_btn, force=True)
-                        await page.wait_for_timeout(2000)
-
-                        otp_confirm = await fetch_disney_otp(email=email, max_wait_seconds=60)
-                        if not otp_confirm:
-                            return {"status": "error", "message": "Gagal mendapatkan OTP Konfirmasi IMAP"}
-
-                        first_otp_elem, active_scope = await get_element('#otp-code-input-otpCode-0', timeout=15000)
-                        await fill_otp_code_and_sync(active_scope, otp_confirm)
-                        
-                        redeem_elem, _ = await get_element(redeem_btn, timeout=8000)
-                        await redeem_elem.click()
-                        await page.wait_for_timeout(4000)
-
-            # 5. KLIK TOMBOL CHANGE PASSWORD UNTUK MENGIRIM OTP RESET
-            try:
-                request_otp_time = time.time()
-                change_pass_elem, _ = await get_element(change_pass_btn, timeout=1000)
-                if progress_cb:
-                    await progress_cb("⚙️ Menekan tombol Change Password…")
-                await change_pass_elem.click(force=True)
-                await page.wait_for_timeout(3000)
-            except Exception:
-                pass
-
-            # 6. CEK ULANG TERAPKAN METODE PENGIRIMAN OTP (JIKA MUNCUL)
-            await handle_choose_delivery_if_present()
-
-            # =========================================================================
-            # 7. MINTA & INPUT OTP RESET PASSWORD
-            # =========================================================================
-            if progress_cb:
-                await progress_cb("📩 Meminta & Mengambil OTP Reset Password…")
-            
-            otp_reset = await fetch_disney_otp(email=email, max_wait_seconds=60, since_time=request_otp_time)
-            if not otp_reset:
-                return {"status": "error", "message": "Gagal menerima OTP Reset Password dari IMAP"}
-
-            first_otp_elem, active_scope = await get_element('#otp-code-input-otpCode-0', timeout=20000)
-            
-            if progress_cb:
-                await progress_cb(f"🔑 Mengisi OTP Reset Password ({otp_reset}) & Sync React State…")
-
-            # Isi OTP dengan sinkronisasi presisi
-            await fill_otp_code_and_sync(active_scope, otp_reset)
-
-            # =========================================================================
-            # PROSES SUBMIT FORM OTP
-            # =========================================================================
-            if progress_cb:
-                await progress_cb("🔘 Mengirimkan Form OTP ke Disney…")
-
-            # PERBAIKAN: Submit Form dari Active Scope (Mendukung iFrame)
-            submit_form_script = """
-                () => {
-                    const form = document.querySelector('#otp-recovery') || document.querySelector('[data-testid="otp-redeem-form"]');
-                    if (form) {
-                        form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-                        if (typeof form.requestSubmit === 'function') {
-                            form.requestSubmit();
-                        }
-                    }
-                }
-            """
-            try:
-                if hasattr(active_scope, "evaluate"):
-                    await active_scope.evaluate(submit_form_script)
-                else:
-                    await page.evaluate(submit_form_script)
-            except Exception:
-                pass
-
-            await page.wait_for_timeout(1000)
-
-            # Metode Cadangan: Klik tombol Continue secara fisik
-            try:
-                btn = active_scope.locator('button[data-testid="redeem-otp"]').first
-                if await btn.is_visible():
-                    await btn.click(force=True)
-            except Exception:
-                pass
-
-            # =========================================================================
-            # 8. TUNGGU PINDAH KE FORM PASSWORD BARU
-            # =========================================================================
-            if progress_cb:
-                await progress_cb("⏳ Memproses OTP & menunggu halaman password baru…")
-
-            new_pass_input = 'input[data-testid="newPassword"], #password-new, input[name="newPassword"]'
-            new_pass_elem, _ = await get_element(new_pass_input, timeout=30000)
-
-            # =========================================================================
-            # 9. MENGISI PASSWORD BARU & SIMPAN
-            # =========================================================================
-            if progress_cb:
-                await progress_cb("🔒 Mengisi password baru...")
-            
-            await new_pass_elem.click()
-            await new_pass_elem.fill(new_password)
+                raise Exception("Field password baru tidak ditemukan.")
+            await progress(f"🔐 Mengisi kata sandi baru: {new_password}")
+            await new_pass_input.click()
+            await new_pass_input.fill(new_password)
+            await new_pass_input.dispatch_event("input")
+            await new_pass_input.dispatch_event("change")
             await page.wait_for_timeout(500)
-
+            confirm_pass_selectors = [
+                'input[data-testid="confirmPassword"]',
+                'input[name="confirmPassword"]',
+                "#password-confirm",
+                'input[name="newPasswordConfirm"]',
+                'input[name="passwordConfirmation"]'
+            ]
+            for selector in confirm_pass_selectors:
+                conf_input = page.locator(selector).first
+                try:
+                    if await conf_input.is_visible():
+                        await progress("🔐 Mengisi konfirmasi kata sandi...")
+                        await conf_input.click()
+                        await conf_input.fill(new_password)
+                        await conf_input.dispatch_event("input")
+                        await conf_input.dispatch_event("change")
+                        await page.wait_for_timeout(300)
+                        break
+                except Exception:
+                    continue
+            await progress("💾 Menyimpan kata sandi baru...")
             save_btn_selector = 'button[data-testid="new-password-submit"], #new-password-submit'
-            save_btn_elem, _ = await get_element(save_btn_selector, timeout=10000)
-            
-            await save_btn_elem.click(force=True)
-
-            await page.wait_for_timeout(5000)
-
-            return {"status": "success", "message": "Password berhasil diubah!"}
-
+            save_btn = page.locator(save_btn_selector).first
+            await save_btn.wait_for(
+                state="visible",
+                timeout=10000
+            )
+            try:
+                await page.wait_for_function(
+                    """
+                    () => {
+                        const btn = document.querySelector('#new-password-submit');
+                        return btn && !btn.disabled;
+                    }
+                    """,
+                    timeout=10000
+                )
+            except Exception:
+                pass
+            await save_btn.click(force=True)
+            await page.wait_for_timeout(4000)
+            try:
+                await page.wait_for_load_state(
+                    "networkidle",
+                    timeout=10000
+                )
+            except Exception:
+                pass
+            post_error_selectors = [
+                '[role="alert"]',
+                ".error",
+                ".form-error",
+                ".invalid-feedback",
+                '[data-testid*="error"]'
+            ]
+            post_error = None
+            for selector in post_error_selectors:
+                errors = page.locator(selector)
+                try:
+                    count = await errors.count()
+                    for i in range(count):
+                        item = errors.nth(i)
+                        if await item.is_visible():
+                            msg = (await item.inner_text()).strip()
+                            if msg:
+                                post_error = msg
+                                break
+                    if post_error:
+                        break
+                except Exception:
+                    continue
+            if post_error:
+                raise Exception(
+                    f"MyDisney menolak perubahan password: {post_error}"
+                )
+            try:
+                still_password_form = (
+                    await page.locator("#new-password-submit").is_visible()
+                    and await page.locator("#password").is_visible()
+                )
+            except Exception:
+                still_password_form = False
+            if still_password_form:
+                raise Exception(
+                    "Form password masih terbuka setelah klik Simpan & Lanjutkan."
+                )
+            await progress("✅ Password MyDisney berhasil diubah.")
+            await update_account_password(
+                email,
+                new_password
+            )
+            if tg_id:
+                await log_activity(
+                    tg_id,
+                    "CHANGE_PASSWORD_MYDISNEY",
+                    email,
+                    "SUCCESS",
+                    "Password berhasil diubah via MyDisney."
+                )
+            return {
+                "status": "success",
+                "message": "Kata sandi MyDisney berhasil diubah!"
+            }
         except Exception as e:
-            return {"status": "failed", "message": str(e)}
+            error_message = str(e)
+            await progress(f"❌ Gagal mengubah password: {error_message}")
+            if tg_id:
+                await log_activity(
+                    tg_id,
+                    "CHANGE_PASSWORD_MYDISNEY",
+                    email,
+                    "FAILED",
+                    error_message
+                )
+            return {
+                "status": "error",
+                "message": f"Gagal mengubah password MyDisney: {error_message}"
+            }
         finally:
-            await page.close()
-            await context.close()
-            await browser.close()
+            try:
+                await page.close()
+            except Exception:
+                pass
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
-async def process_kick_all_in_new_tab(popup_page, email: str, password: str, progress_cb=None) -> bool:
-    """Mengolah alur SSO & Kick All di Tab Baru yang terbuka dari link Anchor"""
+async def change_password_and_kick_all_mydisney(
+    email: str, 
+    new_password: str, 
+    progress_cb=None, 
+    telegram_user: Optional[Dict] = None
+) -> dict:
+    tg_id = telegram_user.get("id") if telegram_user else None
+
+    # 1. Jalankan ganti password dengan keep_open=True
+    chpass_res = await change_password_mydisney(
+        email=email,
+        new_password=new_password,
+        progress_cb=progress_cb,
+        telegram_user=telegram_user,
+        keep_open=True  # <--- PASSING PARAMETER
+    )
+    
+    if chpass_res.get("status") != "success":
+        return chpass_res
+
+    page = chpass_res.get("page")
+    browser = chpass_res.get("browser")
+    playwright = chpass_res.get("playwright")
+
     try:
+        # 2. Panggil process_kick_all_in_mydisney dengan argumen 'email'
+        kick_success = await process_kick_all_in_mydisney(
+            popup_page=page, 
+            email=email,  # <--- PASTIKAN PARAMETER EMAIL DITERUSKAN
+            progress_cb=progress_cb,
+            telegram_user=telegram_user
+        )
+        
+        if kick_success:
+            return {"status": "success", "message": "Password berhasil diubah dan semua perangkat berhasil di-logout."}
+        else:
+            return {"status": "failed", "message": "Password berhasil diubah, namun gagal mengeluarkan seluruh perangkat (Kick All)."}
+
+    except Exception as e:
+        if tg_id:
+            await log_activity(tg_id, "CHANGE_PASS_AND_KICK_ALL", email, "FAILED", str(e))
+        return {"status": "failed", "message": f"Password berhasil diubah, tetapi Kick All gagal: {str(e)}"}
+
+    finally:
+        # Tutup browser & playwright resource setelah seluruh rangkaian alur selesai
+        try:
+            if browser:
+                await browser.close()
+            if playwright:
+                await playwright.stop()
+        except Exception:
+            pass
+
+async def process_kick_all_in_mydisney(popup_page, email: str, progress_cb=None, telegram_user: Optional[Dict] = None) -> bool:
+    """Mengolah alur Kick All / Logout EveryWhere di MyDisney"""
+    tg_id = telegram_user.get("id") if telegram_user else None
+    
+    async def progress(msg: str):
         if progress_cb:
-            await progress_cb("⚙️ Menunggu tab baru SSO MyDisney dimuat...")
+            await progress_cb(msg)
 
-        email_selector = 'input[data-testid="lookupValue"], #lookupValue, input[name="lookupValue"]'
-        submit_btn = 'button[data-testid="id-flow-submit"], #id-flow, button[type="submit"]'
-
-        # 1. Tunggu Input Email
-        await popup_page.wait_for_selector(email_selector, state="visible", timeout=30000)
-
-        if progress_cb:
-            await progress_cb("📧 Memasukkan email di tab baru...")
-
-        await popup_page.click(email_selector)
-        await popup_page.fill(email_selector, email)
-        await popup_page.wait_for_timeout(500)
-        await popup_page.press(email_selector, "Enter")
-        await popup_page.wait_for_timeout(3500)
-
-        # 2. Cek Jika Kembali ke Halaman Utama (Banner Log In)
-        banner_login_btn = 'button[data-testid="banner__button--login"], #sign_in, button:has-text("Log In")'
-        try:
-            if await popup_page.is_visible(banner_login_btn, timeout=3000):
-                if progress_cb:
-                    await progress_cb("🔑 Menekan tombol Log In di Halaman Utama...")
-                await popup_page.click(banner_login_btn)
-                await popup_page.wait_for_timeout(3500)
-        except Exception:
-            pass
-
-        # 3. Cek Jika Minta Input Email Lagi
-        try:
-            if await popup_page.is_visible(email_selector, timeout=4000):
-                if progress_cb:
-                    await progress_cb("📧 Memasukkan ulang email...")
-                await popup_page.click(email_selector)
-                await popup_page.fill(email_selector, email)
-                await popup_page.wait_for_timeout(500)
-                await popup_page.press(email_selector, "Enter")
-                await popup_page.wait_for_timeout(3500)
-        except Exception:
-            pass
-
-        # 4. DETEKSI: PASSWORD ATAU SEND OTP
-        send_passcode_btn = 'button[data-testid="send-passcode-button"]'
-        enter_pass_btn = 'button[data-testid="enter-password-button"]'
-        enter_otp = 'button[data-testid="redeem-otp"]'
-        password_selector = 'input[data-testid="password"], #password, input[type="password"]'
-        otp_input_0 = '#otp-code-input-otpCode-0'
-
-        if await popup_page.is_visible(enter_pass_btn, timeout=3000):
-            await popup_page.click(enter_pass_btn)
-            await popup_page.wait_for_timeout(2000)
-
-        # CASE A: SEND OTP / PASSCODE
-        if await popup_page.is_visible(send_passcode_btn, timeout=3000):
-            if progress_cb:
-                await progress_cb("📩 Menekan tombol Kirim Kode OTP...")
-            await popup_page.click(send_passcode_btn)
-            await popup_page.wait_for_timeout(3000)
-
-        # CASE B: INPUT PASSWORD
-        if await popup_page.is_visible(password_selector, timeout=3000):
-            if progress_cb:
-                await progress_cb("🔑 Memasukkan password di SSO MyDisney...")
-            await popup_page.click(password_selector)
-            await popup_page.fill(password_selector, password)
-            await popup_page.wait_for_timeout(500)
-            await popup_page.press(password_selector, "Enter")
-            await popup_page.wait_for_timeout(4000)
-
-        # 5. CEK PILIHAN METODE VERIFIKASI (JIKA ADA)
-        choose_delivery_btn = '#choose-delivery-method, button[id="choose-delivery-method"]'
-        if await popup_page.is_visible(choose_delivery_btn, timeout=3000):
-            if progress_cb:
-                await progress_cb("📩 Memilih pengiriman OTP via Email...")
-            await popup_page.click(choose_delivery_btn)
-            await popup_page.wait_for_timeout(3000)
-
-        # 6. INPUT OTP & SUBMIT AMAN
-        if await popup_page.is_visible(otp_input_0, timeout=5000):
-            if progress_cb:
-                await progress_cb("📩 Mengambil OTP verifikasi dari IMAP...")
-
-            request_time = time.time() - 10
-            otp_code = await fetch_disney_otp(email=email, max_wait_seconds=60, since_time=request_time)
-
-            if not otp_code or len(otp_code) < 6:
-                if progress_cb:
-                    await progress_cb("❌ Gagal mendapatkan OTP IMAP!")
-                return False
-
-            if progress_cb:
-                await progress_cb(f"🔑 Memasukkan OTP ({otp_code})...")
-
-            # Isi OTP angka per angka
-            for i in range(6):
-                inp = f'#otp-code-input-otpCode-{i}'
-                await popup_page.fill(inp, otp_code[i])
-                await asyncio.sleep(0.05)
-
-            await popup_page.wait_for_timeout(500)
-
-            # Submit via Enter pada input terakhir agar merilis event submit React secara alami
-            await popup_page.press(enter_otp, "Enter")
-            await popup_page.wait_for_timeout(5000)
-
-        recovery_continue_btn = '#recovery-continue, [data-testid="recovery-continue"]'
-        try:
-            if await popup_page.is_visible(recovery_continue_btn, timeout=6000):
-                if progress_cb:
-                    await progress_cb("🔘 Menekan tombol Lanjut (Anda telah masuk ke akun)...")
-                await popup_page.click(recovery_continue_btn, force=True)
-                await popup_page.wait_for_timeout(4000)
-        except Exception:
-            pass
-
-        # =========================================================================
-        # 7. NAVIGASI INTERNAL KE MENU KECAMATAN / ACCESS & SECURITY (TANPA GOTO)
-        # =========================================================================
+    try:
+        # Selector untuk tombol Kick All Utama
         kick_everywhere_btn = '[data-testid="display-card__button--log-out-everywhere"], button:has-text("Keluar dari semua perangkat"), button:has-text("Log out of all devices")'
 
-        # Cek apakah tombol kick_everywhere_btn belum kelihatan di halaman saat ini
+        # 1. NAVIGASI KE HALAMAN ACCESS & SECURITY JIKA BELUM TERLIHAT
         if not await popup_page.is_visible(kick_everywhere_btn):
-            if progress_cb:
-                await progress_cb("⚙️ Berpindah ke menu Keamanan Akun...")
+            await progress("⚙️ Berpindah ke menu Keamanan Akun (Access & Security)...")
 
-            # Mencari tombol navigasi ke Access & Security secara internal di menu MyDisney
-            security_nav_selector = '#access_security_nav, a[href*="access-security"], a:has-text("Keamanan"), a:has-text("Security")'
+            # Selector Link berdasarkan HTML Dashboard resmi: href="/access-security" & teks "View all settings"
+            security_nav_selector = 'a[href*="/access-security"], a:has-text("View all settings"), a:has-text("Lihat semua pengaturan")'
             
+            nav_clicked = False
             try:
-                await popup_page.wait_for_selector(security_nav_selector, state="visible", timeout=10000)
-                await popup_page.click(security_nav_selector, force=True)
-                await popup_page.wait_for_timeout(3000)
+                # Coba klik link di Dashboard
+                nav_link = popup_page.locator(security_nav_selector).first
+                if await nav_link.is_visible(timeout=5000):
+                    await nav_link.click(force=True)
+                    nav_clicked = True
             except Exception:
                 pass
 
-        # =========================================================================
-        # 8. KLIK TOMBOL LOG OUT EVERYWHERE DI TAB BARU
-        # =========================================================================
-        if progress_cb:
-            await progress_cb("🔴 Menekan tombol Keluar dari semua perangkat...")
+            # Fallback jika link UI tidak merespons: Navigasi langsung via URL
+            if not nav_clicked and "access-security" not in popup_page.url:
+                await popup_page.goto("https://my.disney.com/access-security", wait_until="domcontentloaded", timeout=15000)
 
-        # Gunakan locator langsung tanpa wait kaku
+            # Tunggu tombol Kick All muncul di layar
+            try:
+                await popup_page.wait_for_selector(kick_everywhere_btn, state="visible", timeout=15000)
+            except Exception:
+                await progress("⚠️ Tombol Kick All tidak ditemukan di halaman Keamanan.")
+                return False
+
+        # 2. TEKAN TOMBOL LOG OUT OF ALL DEVICES
+        await progress("🔴 Menekan tombol 'Keluar dari semua perangkat'...")
         kick_btn = popup_page.locator(kick_everywhere_btn).first
+        await kick_btn.scroll_into_view_if_needed()
         await kick_btn.click(force=True)
-        await popup_page.wait_for_timeout(1000)
+        await popup_page.wait_for_timeout(2000)
 
-        # =========================================================================
-        # 9. EKSEKUSI KLIK SEND SEGERA (VERIFIKASI KEDUA)
-        # =========================================================================
-        if progress_cb:
-            await progress_cb("📩 Menekan tombol Kirim / Send secara langsung...")
-
-        # Loop pencarian tombol di halaman utama MAUPUN di seluruh iframe
+        # 3. HANDLER TAHAP SEND CODE / VERIFIKASI SSO (JIKA DIPERLUKAN)
+        await progress("📩 Memeriksa konfirmasi pengiriman kode verifikasi Kick All...")
+        
+        # Cari tombol Kirim / Choose Delivery Method baik di main page maupun iframe
         sent_success = False
-        for attempt in range(10):  # Coba periksa setiap 500ms selama 5 detik
+        for attempt in range(8):
             frames_to_check = [popup_page] + popup_page.frames
-
             for frame in frames_to_check:
                 try:
-                    # Jalankan JS Native untuk memilih radio Email & Klik tombol Kirim
                     clicked = await frame.evaluate("""() => {
-                        // 1. Centang radio email jika ada
                         const radio = document.querySelector('#deliveryMethod-0');
                         if (radio) radio.checked = true;
 
-                        // 2. Cari tombol Kirim
                         const btn = document.querySelector('#choose-delivery-method') 
+                                 || document.querySelector('button[data-testid="send-passcode-button"]')
                                  || document.querySelector('button[form="chooseDeliveryMethod"]')
                                  || document.querySelector('button[type="submit"]');
 
-                        if (btn) {
+                        if (btn && btn.offsetParent !== null) {
+                            btn.removeAttribute('disabled');
                             btn.click();
                             return true;
                         }
                         return false;
                     }""")
-
                     if clicked:
                         sent_success = True
                         break
                 except Exception:
                     pass
-
             if sent_success:
                 break
             await asyncio.sleep(0.5)
 
-        if not sent_success and progress_cb:
-            await progress_cb("⚠️ Tombol Kirim tidak ditemukan via JS, mencoba tekan Enter...")
-            await popup_page.keyboard.press("Enter")
-
-        await popup_page.wait_for_timeout(3000)
-
-        # =========================================================================
-        # 9.2. AMBIL & INPUT OTP KEDUA
-        # =========================================================================
-        if progress_cb:
-            await progress_cb("📩 Menunggu kolom OTP kedua...")
-
-        otp_input_0 = '#otp-code-input-otpCode-0'
-        enter_otp = 'button[data-testid="redeem-otp"], button[type="submit"]'
-
-        # Tunggu input OTP di halaman utama atau frame
-        otp_found = False
-        for _ in range(30): # Timeout manual 15 detik
+        # 4. PENANGANAN INPUT OTP KICK ALL
+        await progress("📩 Menunggu kolom kode OTP verifikasi Kick All...")
+        otp_input_selector = '#otp-code-input-otpCode-0'
+        
+        target_frame = None
+        for _ in range(30):  # Wait up to 15 seconds
             for frame in [popup_page] + popup_page.frames:
                 try:
-                    if await frame.is_visible(otp_input_0):
-                        otp_found = True
+                    if await frame.is_visible(otp_input_selector):
                         target_frame = frame
                         break
                 except Exception:
                     pass
-            if otp_found:
+            if target_frame:
                 break
             await asyncio.sleep(0.5)
 
-        if not otp_found:
-            if progress_cb:
-                await progress_cb("❌ Kolom OTP kedua tidak kunjung muncul.")
-            return False
+        # Jika ada modal OTP yang muncul, lakukan pengisian OTP
+        if target_frame:
+            await progress("📩 Mengambil OTP verifikasi Kick All dari IMAP...")
+            request_time = time.time() - 10
+            otp_code = await fetch_disney_otp(email=email, max_wait_seconds=60, since_time=request_time)
 
-        if progress_cb:
-            await progress_cb("📩 Mengambil OTP verifikasi Kick All dari IMAP...")
+            if not otp_code or len(str(otp_code).strip()) < 6:
+                await progress("❌ Gagal mendapatkan OTP verifikasi Kick All!")
+                return False
 
-        request_time_2 = time.time() - 10
-        otp_code_2 = await fetch_disney_otp(email=email, max_wait_seconds=60, since_time=request_time_2)
+            otp_code = str(otp_code).strip()
+            await progress(f"🔑 Memasukkan OTP Kick All ({otp_code})...")
 
-        if not otp_code_2 or len(otp_code_2) < 6:
-            if progress_cb:
-                await progress_cb("❌ Gagal mendapatkan OTP verifikasi Kick All!")
-            return False
+            # Fill 6 box OTP
+            for i in range(6):
+                box = target_frame.locator(f'#otp-code-input-otpCode-{i}')
+                await box.fill(otp_code[i])
+                await box.dispatch_event("input")
+                await box.dispatch_event("change")
+                await asyncio.sleep(0.05)
 
-        if progress_cb:
-            await progress_cb(f"🔑 Memasukkan OTP Kick All ({otp_code_2})...")
+            await popup_page.wait_for_timeout(1000)
 
-        for i in range(6):
-            inp_selector = f'#otp-code-input-otpCode-{i}'
-            await target_frame.fill(inp_selector, otp_code_2[i])
-            await asyncio.sleep(0.05)
+            # Submit OTP
+            await progress("🔘 Memverifikasi OTP Kick All...")
+            enter_otp_selector = 'button[data-testid="redeem-otp"], button[type="submit"]'
+            try:
+                submit_btn = target_frame.locator(enter_otp_selector).first
+                await submit_btn.click(force=True)
+            except Exception:
+                await target_frame.keyboard.press("Enter")
 
-        await popup_page.wait_for_timeout(500)
-        enter_otp_selector = 'button[data-testid="redeem-otp"]'
+            await popup_page.wait_for_timeout(4000)
 
-        await target_frame.wait_for_selector(enter_otp_selector, state="visible", timeout=10000)
-        
-        if progress_cb:
-            await progress_cb("🔘 Menekan tombol Lanjut / Submit OTP...")
+        # 5. EKEKUSI TOMBOL KONFIRMASI AKHIR LOGOUT EVERYWHERE
+        await progress("⚙️ Menunggu konfirmasi 'Keluar' akhir...")
+        final_logout_selector = 'button[data-testid="log-out-everywhere__button--submit-log-out-everywhere"], button:has-text("Log Out"), button:has-text("Keluar")'
 
-        # Cukup panggil klik satu kali pada tombol submit OTP
-        otp_submit_btn = target_frame.locator(enter_otp_selector).first
-        await otp_submit_btn.click(force=True)
+        final_clicked = False
+        for frame in [popup_page] + popup_page.frames:
+            try:
+                btn = frame.locator(final_logout_selector).first
+                if await btn.is_visible(timeout=5000):
+                    await progress("🔴 Menekan tombol Konfirmasi Keluar Akhir...")
+                    await btn.click(force=True)
+                    final_clicked = True
+                    break
+            except Exception:
+                pass
 
-        await popup_page.wait_for_timeout(5000)
-        if progress_cb:
-            await progress_cb("⚙️ Menunggu tombol konfirmasi 'Keluar' akhir...")
+        if not final_clicked:
+            # Fallback via JS native di seluruh frame
+            for frame in [popup_page] + popup_page.frames:
+                try:
+                    await frame.evaluate("""() => {
+                        const btn = document.querySelector('button[data-testid="log-out-everywhere__button--submit-log-out-everywhere"]');
+                        if (btn) btn.click();
+                    }""")
+                except Exception:
+                    pass
 
-        # Tambahkan data-testid tombol "Keluar" yang baru ke dalam selector
-        final_logout_selector = (
-            'button[data-testid="log-out-everywhere__button--submit-log-out-everywhere"], '
-            'button[data-testid="modal-primary-button"], '
-            'button[data-testid="sign-out"], '
-            'button:has-text("Keluar"), '
-            'button:has-text("Log Out"), '
-            'button:has-text("Sign Out")'
-        )
+        await popup_page.wait_for_timeout(3000)
+        await progress("✅ Berhasil mengeluarkan seluruh perangkat (Kick All).")
 
-        try:
-            # Tunggu tombol konfirmasi Keluar/Log Out muncul setelah OTP sukses
-            await target_frame.wait_for_selector(final_logout_selector, state="visible", timeout=15000)
-
-            if progress_cb:
-                await progress_cb("🔴 Menekan tombol Keluar / Log Out akhir...")
-
-            final_btn = target_frame.locator(final_logout_selector).first
-            await final_btn.click(force=True)
-            await popup_page.wait_for_timeout(3000)
-
-        except Exception as e:
-            if progress_cb:
-                await progress_cb(f"⚠️ Peringatan pada tombol keluar akhir: {str(e)}")
+        if tg_id:
+            await log_activity(tg_id, "KICK_ALL_DEVICES", email, "SUCCESS", "Berhasil mengeluarkan seluruh perangkat.")
+        return True
 
     except Exception as e:
-        if progress_cb:
-            await progress_cb(f"❌ Error di Tab Baru SSO: {str(e)}")
+        error_msg = str(e)
+        await progress(f"❌ Error saat Kick All: {error_msg}")
+        if tg_id:
+            await log_activity(tg_id, "KICK_ALL_DEVICES", email, "FAILED", error_msg)
         return False
-
-
+    
