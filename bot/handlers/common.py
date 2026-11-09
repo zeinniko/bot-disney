@@ -7,7 +7,13 @@ from aiogram.exceptions import TelegramBadRequest
 
 from bot.states import MenuState
 from bot.keyboards import get_main_menu_keyboard, get_cancel_keyboard
-from bot.templates import TEXT_START, TEXT_CHPASS_ONLY, TEXT_CHPASS_SIGNOUT, TEXT_LOOKUP_KICK
+from bot.templates import (
+    TEXT_START, 
+    TEXT_CHPASS_ONLY, 
+    TEXT_CHPASS_SIGNOUT, 
+    TEXT_LOOKUP_KICK,
+    TEXT_AUTO_LOGIN_TV
+)
 from utils.process_manager import stop_process
 from database.db import upsert_user
 
@@ -24,12 +30,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
     full_name = message.from_user.full_name or ""
     
     try:
-        # PANGGIL UPSERT TANPA MEMAKSA ROLE JADI CUSTOMER (Agar role admin tidak tertimpa)
         await upsert_user(
             telegram_id=user_id,
             username=username,
             full_name=full_name,
-            role=None  # Biarkan None agar DB mempertahankan role lama jika user sudah ada
+            role=None
         )
         logger.info(f"👤 User checked/updated: {user_id} (@{username})")
     except Exception as e:
@@ -92,6 +97,20 @@ async def process_lookup_kick(callback: types.CallbackQuery, state: FSMContext):
     try:
         await callback.message.edit_text(
             text=TEXT_LOOKUP_KICK,
+            reply_markup=get_cancel_keyboard(),
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data == "btn_auto_login_tv")
+async def process_auto_login_tv(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(MenuState.auto_login_tv)
+    try:
+        await callback.message.edit_text(
+            text=TEXT_AUTO_LOGIN_TV,
             reply_markup=get_cancel_keyboard(),
             parse_mode="HTML",
         )

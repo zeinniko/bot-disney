@@ -8,6 +8,7 @@ from bot.states import MenuState
 from services.disney_service import change_password_mydisney, change_password_and_kick_all_mydisney
 from database.db import get_account_by_access_code, update_account_password, log_activity
 from utils.process_manager import clear_process, is_process_active, start_process
+import asyncio
 
 router = Router()
 
@@ -83,25 +84,27 @@ async def execute_password_change_process(
 
     try:
         # 2. Eksekusi Service Playwright berdasarkan mode
+        tg_user_info = {
+            "id": message.from_user.id,
+            "username": message.from_user.username,
+            "full_name": message.from_user.full_name
+        }
+        
         if is_signout_all:
             res = await change_password_and_kick_all_mydisney(
                 email=email,
                 new_password=password_target,
-                progress_cb=update_status
+                progress_cb=update_status,
+                telegram_user=tg_user_info
             )
             action_log = "CHPASS_SIGNOUT"
         else:
-            tg_user_info = {
-                "id": message.from_user.id,
-                "username": message.from_user.username,
-                "full_name": message.from_user.full_name
-            }
             res = await change_password_mydisney(
                 email=email,
                 new_password=password_target,
                 progress_cb=update_status,
                 telegram_user=tg_user_info,
-                keep_open = False
+                keep_open=False
             )
             action_log = "CHANGE_PASSWORD"
 
@@ -158,13 +161,16 @@ async def execute_password_change_process(
         clear_process(chat_id)
 
 
+
+
 # Handler untuk State Change Password Only
 @router.message(MenuState.chpass_only)
 async def handle_input_chpass_only(message: types.Message, state: FSMContext):
-    await execute_password_change_process(message, state, is_signout_all=False)
+    asyncio.create_task(execute_password_change_process(message, state, is_signout_all=False))
 
 
 # Handler untuk State Change Password + Signout All
 @router.message(MenuState.chpass_signout)
 async def handle_input_chpass_signout(message: types.Message, state: FSMContext):
-    await execute_password_change_process(message, state, is_signout_all=True)
+    asyncio.create_task(execute_password_change_process(message, state, is_signout_all=True))
+    

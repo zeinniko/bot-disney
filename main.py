@@ -4,7 +4,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from config.settings import BOT_TOKEN
-from bot.handlers import common, chpass, lookup_kick, admin
+from bot.handlers import auto_login_tv, common, chpass, lookup_kick, admin
 from database.db import init_db
 
 # Setup logging
@@ -25,9 +25,10 @@ async def main():
 
     # 2. Registrasi Router Handlers
     dp.include_router(common.router)
-    dp.include_router(admin.router)       # Router Admin Ditambahkan
+    dp.include_router(admin.router)
     dp.include_router(chpass.router)
     dp.include_router(lookup_kick.router)
+    dp.include_router(auto_login_tv.router)
 
     logger.info("🤖 Bot Disney+ Management System Siap Dijalankan...")
     print("\n" + "=" * 50)

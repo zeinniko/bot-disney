@@ -44,3 +44,14 @@ TEXT_LOOKUP_KICK = (
     "✅ Contoh:\n"
     "<code>pider@example.com|P4ssw0rd|A3KN7X</code>"
 )
+
+TEXT_AUTO_LOGIN_TV = (
+    "MODE DIPILIH:\n"
+    "📺 <b>Auto Login TV</b>\n\n"
+    "✒️ Kirim data dengan format:\n"
+    "<code>email|password|kode_akses|kode_tv</code>\n\n"
+    "📺 Kode TV = 8 karakter yang muncul di layar TV\n"
+    "(contoh: ABCD1234 atau ABCD-1234)\n\n"
+    "✅ Contoh:\n"
+    "<code>john@example.com|P4ssw0rd|A3KN7X|ABCD1234</code>"
+)

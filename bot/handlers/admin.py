@@ -1,19 +1,13 @@
 import html
+import asyncio
 from aiogram import Router, types
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramAPIError
 from database.db import (
-    is_admin, add_account, regenerate_token, register_member, get_accounts_list, get_members_list
+    is_admin, add_account, regenerate_token, register_member, get_accounts_list, get_members_list, get_all_telegram_users
 )
 
 router = Router()
-
-# Middleware Admin Check
-# @router.message.outer_middleware()
-# async def admin_guard_middleware(handler, event, data):
-#     user_id = event.from_user.id
-#     if not await is_admin(user_id):
-#         return await event.answer("⛔ Anda tidak memiliki akses ke fitur Admin Panel.")
-#     return await handler(event, data)
 
 @router.message(Command("admin"))
 async def show_admin_panel(message: types.Message):
@@ -25,6 +19,7 @@ async def show_admin_panel(message: types.Message):
         "3. Regenerate Token:\n`/regen_token <email_akun>|[YYYY-MM-DD]`\n"
         "4. Cek List Akun Produk:\n`/list_acc [halaman]`\n"
         "5. Cek List Member/Langganan:\n`/list_member [halaman]`\n"
+        "6. Broadcast Pesan ke User:\n`/broadcast <pesan_bebas>`\n"
     )
     await message.answer(menu, parse_mode="Markdown")
     
@@ -169,3 +164,61 @@ async def handle_list_member(message: types.Message):
 
     except Exception as e:
         await message.answer(f"❌ Gagal mengambil daftar member: {e}")
+        
+@router.message(Command("broadcast"))
+async def handle_broadcast(message: types.Message):
+    """Menyiarkan pesan ke seluruh user Telegram yang terdaftar di database."""
+    try:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer(
+                "Format salah! Gunakan format:\n"
+                "<code>/broadcast <pesan_yang_ingin_dikirim></code>\n\n"
+                "<i>Catatan: Bisa menggunakan format HTML seperti <b>teks tebal</b> atau <code>kode</code>.</i>",
+                parse_mode="HTML"
+            )
+            return
+
+        broadcast_text = parts[1].strip()
+        users = await get_all_telegram_users()
+
+        if not users:
+            await message.answer("❌ Tidak ada user terdaftar di database.")
+            return
+
+        status_msg = await message.answer(f"⏳ **Memulai broadcast ke {len(users)} user…**", parse_mode="Markdown")
+
+        success_count = 0
+        blocked_count = 0
+        failed_count = 0
+
+        for user_id in users:
+            try:
+                await message.bot.send_message(
+                    chat_id=user_id,
+                    text=broadcast_text,
+                    parse_mode="HTML"
+                )
+                success_count += 1
+            except TelegramForbiddenError:
+                # User telah memblokir bot
+                blocked_count += 1
+            except (TelegramBadRequest, TelegramAPIError):
+                failed_count += 1
+            except Exception:
+                failed_count += 1
+
+            # Jeda 0.05 detik per pengiriman agar tidak terkena limit rate Telegram (maks ~20 pesan/detik)
+            await asyncio.sleep(0.05)
+
+        report = (
+            f"📢 <b>Laporan Broadcast Selesai</b>\n\n"
+            f"🎯 Total Target: <b>{len(users)}</b>\n"
+            f"✅ Berhasil Terkirim: <b>{success_count}</b>\n"
+            f"🚫 Memblokir Bot: <b>{blocked_count}</b>\n"
+            f"❌ Gagal/Error: <b>{failed_count}</b>"
+        )
+        await status_msg.edit_text(report, parse_mode="HTML")
+
+    except Exception as e:
+        await message.answer(f"❌ Terjadi kesalahan saat broadcast: {e}")

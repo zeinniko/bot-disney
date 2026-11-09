@@ -24,6 +24,13 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
                 style="danger",
             )
         ],
+        [
+            InlineKeyboardButton(
+                text="📺 Auto Login TV",
+                callback_data="btn_auto_login_tv",
+                style="primary",
+            )
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 

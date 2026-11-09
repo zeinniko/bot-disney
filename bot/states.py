@@ -5,3 +5,4 @@ class MenuState(StatesGroup):
     chpass_only = State()
     chpass_signout = State()
     lookup_kick = State()
+    auto_login_tv = State()

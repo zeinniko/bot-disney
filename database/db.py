@@ -248,3 +248,13 @@ async def get_members_list(limit: int = 20, offset: int = 0) -> list[Dict]:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
         
+async def get_all_telegram_users() -> list[int]:
+    """Mengambil seluruh telegram_id terdaftar dari tabel users untuk keperluan broadcast."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT telegram_id FROM users WHERE telegram_id IS NOT NULL"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+        
+        
