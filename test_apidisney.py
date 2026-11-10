@@ -154,6 +154,9 @@ async def main():
   browser = await pw.chromium.launch(
       headless=False,
       channel="chrome",
+      proxy={
+                "server": "socks5://127.0.0.1:40000"
+            },
       args=[
           "--disable-blink-features=AutomationControlled", 
           "--no-sandbox",

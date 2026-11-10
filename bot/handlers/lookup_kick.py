@@ -217,6 +217,9 @@ async def handle_input_lookup_kick(message: types.Message, state: FSMContext):
         pw = await async_playwright().start()
         browser = await pw.chromium.launch(
             headless=HEADLESS_MODE,
+            proxy={
+                "server": "socks5://127.0.0.1:40000"
+            },
             args=[
                 "--disable-blink-features=AutomationControlled", 
                 "--no-sandbox",

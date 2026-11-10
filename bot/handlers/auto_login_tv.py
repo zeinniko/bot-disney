@@ -195,6 +195,9 @@ async def handle_input_auto_login_tv(message: types.Message, state: FSMContext):
         browser = await pw.chromium.launch(
             headless=False,
             channel="chrome",
+            proxy={
+                "server": "socks5://127.0.0.1:40000"
+            },
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",

@@ -402,6 +402,9 @@ async def change_password_mydisney(
     try:
         browser = await p.chromium.launch(
             headless=HEADLESS_MODE,
+            proxy={
+                "server": "socks5://127.0.0.1:40000"
+            },
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
