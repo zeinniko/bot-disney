@@ -824,7 +824,7 @@ async def change_password_mydisney(
             res.update({
                 "page": page,
                 "browser": browser,
-                "playwright": p
+                "playwright": pw
             })
         return res
     except Exception as e:
@@ -857,7 +857,7 @@ async def change_password_mydisney(
             except Exception:
                 pass
             try:
-                if p: await p.stop()
+                if pw: await pw.stop()
             except Exception:
                 pass
             
