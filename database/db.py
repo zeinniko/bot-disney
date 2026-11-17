@@ -9,10 +9,17 @@ DB_PATH = "bot_data.db"
 async def init_db():
     """Inisialisasi tabel database saat bot start."""
     async with aiosqlite.connect(DB_PATH) as db:
-        with open("database/schema.sql", "r") as f:
+        with open("database/schema.sql", "r", encoding="utf-8") as f:
             await db.executescript(f.read())
         await db.commit()
 
+async def close_db():
+    """Menyinkronkan WAL & mengoptimalkan SQLite sebelum bot berhenti."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        await db.execute("PRAGMA optimize;")
+        await db.commit()
+        
 def generate_access_code(length: int = 6) -> str:
     """Menghasilkan kode unik acak seperti A3KN7X."""
     chars = string.ascii_uppercase + string.digits
@@ -50,26 +57,32 @@ async def is_admin(telegram_id: int) -> bool:
             row = await cursor.fetchone()
             return row is not None and row[0] == 'admin'
 
-# --- VALIDASI & PEMBARUAN PASSWORD ---
-
 async def get_account_by_access_code(email: str, access_code: str) -> Optional[Dict]:
-    """Validasi email, kode akses, dan cek apakah token belum expired."""
+    """Validasi email & kode akses sekaligus mengecek status kedaluwarsa (waktu lokal)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT a.id, a.email, a.current_password, k.access_code, k.expired_at
+            SELECT 
+                a.id, 
+                a.email, 
+                a.current_password, 
+                k.access_code, 
+                k.expired_at,
+                CASE 
+                    WHEN k.expired_at IS NOT NULL AND k.expired_at < DATETIME('now', 'localtime') THEN 1 
+                    ELSE 0 
+                END AS is_expired
             FROM accounts a
             JOIN access_keys k ON a.id = k.account_id
             WHERE LOWER(a.email) = LOWER(?) 
-              AND k.access_code = ?
-              AND (k.expired_at IS NULL OR k.expired_at >= CURRENT_TIMESTAMP)
+              AND UPPER(k.access_code) = UPPER(?)
             """,
             (email.strip(), access_code.strip())
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
-
+        
 async def update_account_password(email: str, new_password: str):
     """Memperbarui password di database lokal setelah alur Playwright berhasil."""
     async with aiosqlite.connect(DB_PATH) as db:

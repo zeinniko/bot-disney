@@ -195,30 +195,17 @@ async def handle_input_auto_login_tv(message: types.Message, state: FSMContext):
         browser = await pw.chromium.launch(
             headless=False,
             channel="chrome",
-            proxy={
-                "server": "socks5://127.0.0.1:40000"
-            },
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
-                "--no-first-run",
-                "--no-zygote",
-                "--disable-infobars",
-                "--window-size=1280,720",
-                "--lang=en-US,en",
-                "--disable-gpu",
-                "--disable-software-rasterizer",
-                "--disable-extensions"
+                "--window-size=1366,768",
             ]
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36",
-            locale="en-US",
-            ignore_https_errors=True,
-            viewport={'width': 1280, 'height': 720}
+            locale="id-ID",
+            timezone_id="Asia/Jakarta",
+            viewport={"width": 1366, "height": 768}
         )
         page = await context.new_page()
 

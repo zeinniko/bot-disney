@@ -48,6 +48,14 @@ async def execute_password_change_process(
         )
         return
 
+    if acc_data.get("is_expired"):
+        await message.answer(
+            f"⏳ <b>Verifikasi Gagal:</b> Kode Akses sudah kedaluwarsa pada <code>{acc_data['expired_at']}</code>.\n"
+            "Silakan hubungi admin untuk perpanjangan.",
+            parse_mode="HTML"
+        )
+        return
+
     current_password = acc_data["current_password"]
     password_target = (
         parts[2].strip()
